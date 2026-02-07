@@ -1,0 +1,21 @@
+# Env and secrets — do not commit
+.env
+.env.local
+.env.*.local
+
+# Raw MT-Bench (and other) data — do not commit
+data/raw/*
+!data/raw/.gitkeep
+
+# Generated subset (from raw); do not commit
+data/mt_bench_subset.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
