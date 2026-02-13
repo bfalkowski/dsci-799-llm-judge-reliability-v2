@@ -43,7 +43,16 @@ _captions = _load_captions()
 # --- Page config and title ---
 st.set_page_config(page_title="LLM-as-a-Judge Reliability", layout="wide")
 
-# TODO: Add custom CSS
+# Load and inject custom CSS
+def _load_css():
+    path = CONTENT_DIR / "dashboard.css"
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    return ""
+
+_css = _load_css()
+if _css:
+    st.markdown(f"<style>{_css}</style>", unsafe_allow_html=True)
 
 st.title(_captions.get("title", "LLM-as-a-Judge Reliability & Execution Integrity"))
 
