@@ -6,14 +6,14 @@ LLM-as-a-Judge Reliability Dashboard (STUB)
 import json
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 # Paths relative to repo root (where dashboard.py lives).
 REPO_ROOT = Path(__file__).resolve().parent
-
+ENCODING = "utf-8"
 RESULTS_DIR = REPO_ROOT / "results"
 DATA_DIR = REPO_ROOT / "data"
-
 CONTENT_DIR = REPO_ROOT / "dashboard_content"
 
 
@@ -22,7 +22,7 @@ def _load_content(name, ext="md"):
     path = CONTENT_DIR / f"{name}.{ext}"
     if not path.exists():
         return ""
-    return path.read_text(encoding="utf-8").strip()
+    return path.read_text(encoding=ENCODING).strip()
 
 
 def _load_captions():
@@ -31,7 +31,7 @@ def _load_captions():
     if not path.exists():
         return {}
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding=ENCODING) as f:
             return json.load(f)
     except Exception:
         return {}
@@ -47,7 +47,7 @@ st.set_page_config(page_title="LLM-as-a-Judge Reliability", layout="wide")
 def _load_css():
     path = CONTENT_DIR / "dashboard.css"
     if path.exists():
-        return path.read_text(encoding="utf-8")
+        return path.read_text(encoding=ENCODING)
     return ""
 
 _css = _load_css()
@@ -82,13 +82,45 @@ with tab_overview:
 
 # ==================== TAB 2: View Results ====================
 with tab_view:
+    jsonl_files = list(RESULTS_DIR.glob("*.jsonl")) if RESULTS_DIR.exists() else []
+    if not jsonl_files:
+        st.info("No result files in results")
+    else:
+        selected = st.selectbox("Result file", [f.name for f in jsonl_files], key="view_results_file")
+        path = RESULTS_DIR / selected
+        rows = []
+        with path.open("r", encoding=ENCODING) as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+        if rows:
+            df = pd.DataFrame(rows)
 
-        # TODO: Panel 1 — Experiment Overview 
-    # TODO: Panel 2 — Score 
-    # TODO: Panel 3 —TBD
-    # TODO: Panel 4 — TBD
-    # TODO: Panel 5 — TBD
-    st.info("TODO: Implement View Results")
+            # Raw data
+            with st.expander("Raw judgments", expanded=True):
+                st.dataframe(df, use_container_width=True)
+
+            # TODO: Per-item score variance (Var_i = sample variance across K runs)
+            with st.expander("Per-item score variance", expanded=False):
+                st.info("TODO: Var_i = sample variance across K runs per item.")
+
+            # TODO: Pairwise agreement rate (matching pairs / K(K-1)/2)
+            with st.expander("Pairwise agreement rate", expanded=False):
+                st.info("TODO: Agreement_i = matching pairs / total pairs (total pairs = K(K-1)/2).")
+
+            # TODO: Distribution of disagreements
+            with st.expander("Distribution of disagreements", expanded=False):
+                st.info("TODO: Show distribution of score disagreements across items.")
+
+            # TODO: Latency vs score correlation
+            with st.expander("Latency vs score", expanded=False):
+                st.info("TODO: Scatter plot of latency_ms vs score, correlation.")
+
+            # TODO: Summary statistics
+            with st.expander("Summary statistics", expanded=False):
+                st.info("TODO: Overall summary stats across all items and runs.")
+        else:
+            st.info("File is empty.")
 
 
 # ==================== TAB 3: Run Experiment ==============
@@ -100,18 +132,19 @@ with tab_run:
     st.info("TODO Implement Run Experiment formm ")
 
 
-# ==================== TAB 4: Manage ====================
-with tab_manage:
-    # TODO: Delete experiments  
-    
-    st.header("Manage")
-    st.info("TODO: Implement Manage tab..")
 
-
-# ==================== TAB 5: Telemetry (OTEL) ====================
+# ==================== TAB 4: Telemetry (OTEL) ====================
 
 if tab_otel:
     with tab_otel:
         # TODO: Sync with View Results 
         st.header("Telemetry - OTEL")
         st.info("TODO: Implement Telemetry tab")
+
+
+# ==================== TAB 5: Manage ====================
+with tab_manage:
+    # TODO: Delete experiments  
+    
+    st.header("Manage")
+    st.info("TODO: Implement Manage tab..")
