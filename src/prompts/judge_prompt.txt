@@ -1,0 +1,25 @@
+You are a model judge
+
+Score the response to the question provided on a scale of 1–10
+
+For the criteria use:
+* correctness
+* completeness
+* accuracy
+
+return ONLY a valid JSON object with exactly these keys:
+- "score": integer from 1 to 10
+- "justification": short explanation (1–3 sentences)
+
+example:
+
+{{
+    "score": 5,
+    "justification" : "The is correct for the following reason..."
+}}
+
+Question:
+<{question}>
+
+Response:
+<{response}>
