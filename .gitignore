@@ -7,9 +7,6 @@
 data/raw/*
 !data/raw/.gitkeep
 
-# Generated subset (from raw); do not commit
-data/mt_bench_subset.json
-
 # Python
 __pycache__/
 *.py[cod]

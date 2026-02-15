@@ -1,0 +1,8 @@
+# For LLM-as-a-judge and MT-Bench response generation (OpenAI). Required for experiments.
+openai>=1.0.0
+# Load .env so OPENAI_API_KEY can be set in a file (not required if you export in the shell).
+python-dotenv>=1.0.0
+
+# Dashboard (visualization only).
+streamlit>=1.28.0
+pandas>=1.5.0

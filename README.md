@@ -18,6 +18,16 @@ human-labeled ground truth and when they become unreliable.
 - Training new foundation or judge models
 - Optimizing prompt quality beyond what is needed for evaluation consistency
 
+## Setup
+
+From the repository root:
+
+```bash
+pip install -r requirements.txt
+```
+
+Copy `.env.example` to `.env` and add your `OPENAI_API_KEY` for experiments that call the judge API.
+
 ## Repository Structure
 
 - `docs/` – proposal drafts and literature review notes
@@ -30,10 +40,9 @@ human-labeled ground truth and when they become unreliable.
 
 ## Starting the Dashboard UI
 
-From the repository root:
+After [Setup](#setup):
 
 ```bash
-pip install streamlit pandas
 streamlit run dashboard.py
 ```
 
