@@ -9,18 +9,17 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 from constants import JUDGE_MODEL
+from utils import ENCODING, REPO_ROOT
 
 # ---------- CONFIG ----------
-REPOROOT = Path(__file__).resolve().parent.parent
-
-INPUT_PATH = REPOROOT / "data" / "mt_bench_subset.json"
+INPUT_PATH = REPO_ROOT / "data" / "mt_bench_subset.json"
 
 JUDGE_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "judge_prompt.txt"
 
 REPEATS = 1
 TEMPERATURE = 0.0  
 
-#OUTPUT_PATH = REPOROOT / "results" / "exp01_repeated_judging.jsonl"
+#OUTPUT_PATH = REPO_ROOT / "results" / "exp01_repeated_judging.jsonl"
 
 timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
 OUTPUT_PATH = Path(f"results/mtbench_judge-{JUDGE_MODEL}_K{REPEATS}_t{TEMPERATURE}_{timestamp}.jsonl")
@@ -30,16 +29,16 @@ logger = logging.getLogger(__name__)
 
 def load_judge_prompt() -> str:
     """Load judge prompt ..."""
-    return JUDGE_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    return JUDGE_PROMPT_PATH.read_text(encoding=ENCODING).strip()
 
 
 def load_dataset(path: Path):
-    with path.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding=ENCODING) as f:
         return json.load(f)
 
 
 def main():
-    load_dotenv(REPOROOT / ".env")
+    load_dotenv(REPO_ROOT / ".env")
     client = OpenAI()
 
     dataset = load_dataset(INPUT_PATH)

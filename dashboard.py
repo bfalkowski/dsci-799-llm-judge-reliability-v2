@@ -4,14 +4,21 @@ LLM-as-a-Judge Reliability Dashboard (STUB)
 """
 
 import json
+import sys
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-# Paths relative to repo root (where dashboard.py lives).
-REPO_ROOT = Path(__file__).resolve().parent
-ENCODING = "utf-8"
+# Allow importing from src when dashboard runs from repo root
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+from compute_metrics import (
+    _group_by_item,
+    metric1_per_item_variance,
+    metric2_exact_agreement,
+    metric3_score_histogram,
+)
+from utils import ENCODING, REPO_ROOT, load_jsonl
 RESULTS_DIR = REPO_ROOT / "results"
 DATA_DIR = REPO_ROOT / "data"
 CONTENT_DIR = REPO_ROOT / "dashboard_content"
@@ -88,48 +95,60 @@ with tab_view:
     else:
         selected = st.selectbox("Result file", [f.name for f in jsonl_files], key="view_results_file")
         path = RESULTS_DIR / selected
-        rows = []
-        with path.open("r", encoding=ENCODING) as f:
-            for line in f:
-                if line.strip():
-                    rows.append(json.loads(line))
+        rows = load_jsonl(path)
         if rows:
             df = pd.DataFrame(rows)
+            by_item = _group_by_item(rows)
+            m1 = metric1_per_item_variance(by_item)
+            m2 = metric2_exact_agreement(by_item)
+            counts = metric3_score_histogram(rows)
 
-            # Raw data
+            # Metrics section
+            st.subheader("Reliability metrics")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Mean variance", f"{m1['mean_variance']:.4f}")
+                st.caption("Per-item score variance across K runs")
+            with col2:
+                st.metric("% zero variance", f"{m1['pct_items_zero_variance']:.1f}%")
+                st.caption(f"{m1['zero_var_count']} / {m1['n_items']} items")
+            with col3:
+                st.metric("Exact agreement", f"{m2['mean_agreement_rate']:.1%}")
+                st.caption("Mean pairwise score match rate")
+
+            # Score distribution
+            st.subheader("Score distribution")
+            if counts:
+                hist_df = pd.DataFrame(
+                    {"score": list(counts.keys()), "count": list(counts.values())}
+                ).sort_values("score")
+                st.bar_chart(hist_df.set_index("score"))
+            else:
+                st.info("No scores to display.")
+
             with st.expander("Raw judgments", expanded=True):
                 st.dataframe(df, use_container_width=True)
 
-            # TODO: Per-item score variance (Var_i = sample variance across K runs)
-            with st.expander("Per-item score variance", expanded=False):
-                st.info("TODO: Var_i = sample variance across K runs per item.")
-
-            # TODO: Pairwise agreement rate (matching pairs / K(K-1)/2)
-            with st.expander("Pairwise agreement rate", expanded=False):
-                st.info("TODO: Agreement_i = matching pairs / total pairs (total pairs = K(K-1)/2).")
-
-            # TODO: Distribution of disagreements
-            with st.expander("Distribution of disagreements", expanded=False):
-                st.info("TODO: Show distribution of score disagreements across items.")
-
-            # TODO: Latency vs score correlation
-            with st.expander("Latency vs score", expanded=False):
-                st.info("TODO: Scatter plot of latency_ms vs score, correlation.")
-
-            # TODO: Summary statistics
-            with st.expander("Summary statistics", expanded=False):
-                st.info("TODO: Overall summary stats across all items and runs.")
         else:
             st.info("File is empty.")
 
 
 # ==================== TAB 3: Run Experiment ==============
-# ====
 with tab_run:
-    # TODO: Subset dropdown
-    
     st.header("Run Experiment")
-    st.info("TODO Implement Run Experiment formm ")
+    st.info("TODO Implement Run Experiment form.")
+
+    # Show raw results (most recent) so you can see output format
+    jsonl_files = list(RESULTS_DIR.glob("*.jsonl")) if RESULTS_DIR.exists() else []
+    if jsonl_files:
+        latest = max(jsonl_files, key=lambda p: p.stat().st_mtime)
+        st.subheader("Latest results (raw)")
+        st.caption(f"{latest.name}")
+        rows = load_jsonl(latest)
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        else:
+            st.info("File is empty.")
 
 
 
