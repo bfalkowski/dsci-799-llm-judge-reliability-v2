@@ -38,6 +38,14 @@ def variance(scores: List[float]) -> float:
     return sum((x - mean) ** 2 for x in scores) / (n - 1)
 
 
+def per_item_variances(by_item: Dict[str, List[int]]) -> List[dict]:
+    """Return per-item variance for charting: [{item_id, variance}, ...]."""
+    return [
+        {"item_id": item_id, "variance": variance(scores)}
+        for item_id, scores in by_item.items()
+    ]
+
+
 def metric1_per_item_variance(by_item: Dict[str, List[int]]) -> dict:
     """Per-item variance, mean variance, % items with zero variance."""
     variances = []
@@ -78,6 +86,55 @@ def metric2_exact_agreement(by_item: Dict[str, List[int]]) -> dict:
         "mean_agreement_rate": mean_agreement,
         "n_items": n_items,
     }
+
+
+def per_item_table(rows: List[dict]) -> List[dict]:
+    """Per-item aggregation for table: mean_score, variance, std_dev, min/max, agreement, latency stats."""
+    from math import sqrt
+    by_item: Dict[str, List[dict]] = {}
+    for r in rows:
+        item_id = str(r.get("item_id", ""))
+        by_item.setdefault(item_id, []).append(r)
+
+    result = []
+    for item_id, item_rows in by_item.items():
+        scores = [s for r in item_rows if (s := _get_score(r)) is not None]
+        latencies = [r.get("latency_ms") for r in item_rows if r.get("latency_ms") is not None]
+        latencies = [int(x) for x in latencies if isinstance(x, (int, float))]
+
+        n = len(scores)
+        mean_score = sum(scores) / n if n else None
+        var = variance(scores)
+        std_dev = sqrt(var) if var > 0 else 0.0
+
+        # Agreement rate
+        total_pairs = n * (n - 1) // 2 if n else 0
+        if total_pairs == 0:
+            agreement_rate = 1.0
+        else:
+            matching = sum(1 for a, b in itertools.combinations(scores, 2) if a == b)
+            agreement_rate = matching / total_pairs
+
+        mean_latency = sum(latencies) / len(latencies) if latencies else None
+        if len(latencies) >= 2:
+            lat_mean = sum(latencies) / len(latencies)
+            latency_var = sum((x - lat_mean) ** 2 for x in latencies) / (len(latencies) - 1)
+            latency_std_dev = sqrt(latency_var)
+        else:
+            latency_std_dev = 0.0 if latencies else None
+
+        result.append({
+            "item_id": item_id,
+            "mean_score": round(mean_score, 2) if mean_score is not None else None,
+            "variance": round(var, 4),
+            "std_dev": round(std_dev, 4),
+            "min_score": min(scores) if scores else None,
+            "max_score": max(scores) if scores else None,
+            "agreement_rate": round(agreement_rate, 4),
+            "mean_latency": round(mean_latency, 0) if mean_latency is not None else None,
+            "latency_std_dev": round(latency_std_dev, 1) if latency_std_dev is not None else None,
+        })
+    return result
 
 
 def metric3_score_histogram(rows: List[dict]) -> Dict[int, int]:

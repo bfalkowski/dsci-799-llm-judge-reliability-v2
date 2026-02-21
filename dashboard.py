@@ -7,7 +7,9 @@ import json
 import sys
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 # Allow importing from src when dashboard runs from repo root
@@ -17,6 +19,7 @@ from compute_metrics import (
     metric1_per_item_variance,
     metric2_exact_agreement,
     metric3_score_histogram,
+    variance,
 )
 from utils import ENCODING, REPO_ROOT, load_jsonl
 RESULTS_DIR = REPO_ROOT / "results"
@@ -116,13 +119,87 @@ with tab_view:
                 st.metric("Exact agreement", f"{m2['mean_agreement_rate']:.1%}")
                 st.caption("Mean pairwise score match rate")
 
+            # Overall reliability: stable vs unstable
+            st.subheader("Overall reliability")
+            st.caption(
+                "Non-zero variance = judge instability (same response, different scores across repeats)."
+            )
+            var_data = [{"item_id": i, "variance": variance(s)} for i, s in by_item.items()]
+            if var_data:
+                stable = sum(1 for v in var_data if v["variance"] == 0)
+                unstable = len(var_data) - stable
+                summary_df = pd.DataFrame([
+                    {"status": "Stable (0 variance)", "items": stable},
+                    {"status": "Unstable (>0 variance)", "items": unstable},
+                ])
+                col1, col2 = st.columns(2)
+                with col1:
+                    fig = px.bar(
+                        summary_df,
+                        x="items",
+                        y="status",
+                        orientation="h",
+                        color="status",
+                        color_discrete_map={
+                            "Stable (0 variance)": "#808080",
+                            "Unstable (>0 variance)": "#808080",
+                        },
+                        pattern_shape="status",
+                        pattern_shape_map={
+                            "Stable (0 variance)": "",
+                            "Unstable (>0 variance)": "/",
+                        },
+                    )
+                    fig.update_layout(
+                        xaxis_title="Number of items",
+                        yaxis_title="",
+                        height=280,
+                        showlegend=False,
+                        margin=dict(t=20, b=40),
+                    )
+                    fig.update_traces(marker_pattern_fillmode="overlay")
+                    st.plotly_chart(fig, use_container_width=True)
+                with col2:
+                    # Variance distribution: how many items fall in each variance bucket
+                    var_df = pd.DataFrame(var_data)
+                    var_df["bucket"] = pd.cut(
+                        var_df["variance"],
+                        bins=[-0.1, 0, 0.25, 0.5, 1.0, 10],
+                        labels=["0", "0–0.25", "0.25–0.5", "0.5–1", "1+"],
+                    )
+                    bucket_counts = var_df.groupby("bucket", observed=True).size().reset_index(name="count")
+                    dist_chart = (
+                        alt.Chart(bucket_counts)
+                        .mark_bar(color="#808080")
+                        .encode(
+                            x=alt.X("bucket:N", title="Variance range"),
+                            y=alt.Y("count:Q", title="Items"),
+                        )
+                        .properties(height=280)
+                    )
+                    st.altair_chart(dist_chart, use_container_width=True)
+
             # Score distribution
             st.subheader("Score distribution")
             if counts:
                 hist_df = pd.DataFrame(
                     {"score": list(counts.keys()), "count": list(counts.values())}
                 ).sort_values("score")
-                st.bar_chart(hist_df.set_index("score"))
+                hist_df["score"] = hist_df["score"].astype(str)
+                score_chart = (
+                    alt.Chart(hist_df)
+                    .mark_bar(color="#808080")
+                    .encode(
+                        x=alt.X(
+                            "score:N",
+                            title="Score",
+                            axis=alt.Axis(labelAngle=-90),
+                        ),
+                        y=alt.Y("count:Q", title="Count"),
+                    )
+                    .properties(height=280)
+                )
+                st.altair_chart(score_chart, use_container_width=True)
             else:
                 st.info("No scores to display.")
 
