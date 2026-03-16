@@ -143,6 +143,94 @@ def metric3_score_histogram(rows: List[dict]) -> Dict[int, int]:
     return dict(Counter(scores))
 
 
+def otel_metrics(rows: List[dict]) -> dict:
+    """OTEL-derived metrics: token usage, span status, trace coverage.
+
+    Uses input_tokens, output_tokens, span_status when present (from instrumented runs).
+    Returns empty/minimal dict for older JSONL without OTEL fields.
+    """
+    if not rows:
+        return {}
+
+    has_tokens = any(r.get("input_tokens") is not None or r.get("output_tokens") is not None for r in rows)
+    has_trace = any(r.get("trace_id") for r in rows)
+
+    result = {
+        "total_spans": len(rows),
+        "trace_ids": list({r["trace_id"] for r in rows if r.get("trace_id")}),
+        "span_status_ok": sum(1 for r in rows if r.get("span_status") == "ok"),
+        "span_status_error": sum(1 for r in rows if r.get("span_status") == "error"),
+    }
+
+    if has_tokens:
+        input_tokens = [r["input_tokens"] for r in rows if r.get("input_tokens") is not None]
+        output_tokens = [r["output_tokens"] for r in rows if r.get("output_tokens") is not None]
+        result["total_input_tokens"] = sum(input_tokens)
+        result["total_output_tokens"] = sum(output_tokens)
+        result["mean_input_tokens"] = sum(input_tokens) / len(input_tokens) if input_tokens else 0
+        result["mean_output_tokens"] = sum(output_tokens) / len(output_tokens) if output_tokens else 0
+        # Per-item token variance (reliability: does token count vary for same item?)
+        by_item_tokens: Dict[str, List[int]] = {}
+        for r in rows:
+            ti, to = r.get("input_tokens"), r.get("output_tokens")
+            if ti is not None and to is not None:
+                iid = str(r.get("item_id", ""))
+                by_item_tokens.setdefault(iid, []).append(ti + to)
+        token_variances = [variance(v) for v in by_item_tokens.values() if len(v) >= 2]
+        result["mean_token_variance_per_item"] = sum(token_variances) / len(token_variances) if token_variances else 0
+    else:
+        result["total_input_tokens"] = None
+        result["total_output_tokens"] = None
+        result["mean_input_tokens"] = None
+        result["mean_output_tokens"] = None
+        result["mean_token_variance_per_item"] = None
+
+    result["has_otel"] = has_trace or has_tokens
+
+    # Per-item token details for dashboard (between-item & within-item)
+    if has_tokens:
+        by_item: Dict[str, List[dict]] = {}
+        for r in rows:
+            iid = str(r.get("item_id", ""))
+            by_item.setdefault(iid, []).append(r)
+        per_item_list = []
+        for item_id, item_rows in by_item.items():
+            inputs = [r["input_tokens"] for r in item_rows if r.get("input_tokens") is not None]
+            outputs = [r["output_tokens"] for r in item_rows if r.get("output_tokens") is not None]
+            totals = [
+                r.get("input_tokens", 0) + r.get("output_tokens", 0)
+                for r in item_rows
+                if r.get("input_tokens") is not None and r.get("output_tokens") is not None
+            ]
+            scores = [_get_score(r) for r in item_rows if _get_score(r) is not None]
+            mean_input = sum(inputs) / len(inputs) if inputs else 0
+            mean_output = sum(outputs) / len(outputs) if outputs else 0
+            within_var = variance(totals) if len(totals) >= 2 else 0
+            per_item_list.append({
+                "item_id": item_id,
+                "mean_input_tokens": round(mean_input, 1),
+                "mean_output_tokens": round(mean_output, 1),
+                "mean_total_tokens": round(mean_input + mean_output, 1),
+                "within_item_variance": round(within_var, 2),
+                "repeats": len(item_rows),
+                "mean_score": round(sum(scores) / len(scores), 2) if scores else None,
+            })
+        result["per_item_token_details"] = sorted(per_item_list, key=lambda x: x["item_id"])
+        # Between-item spread
+        if per_item_list:
+            mean_totals = [p["mean_total_tokens"] for p in per_item_list]
+            result["between_item_min_tokens"] = min(mean_totals)
+            result["between_item_max_tokens"] = max(mean_totals)
+            result["between_item_range"] = max(mean_totals) - min(mean_totals)
+    else:
+        result["per_item_token_details"] = []
+        result["between_item_min_tokens"] = None
+        result["between_item_max_tokens"] = None
+        result["between_item_range"] = None
+
+    return result
+
+
 def print_histogram(counts: Dict[int, int]) -> None:
     """Print ASCII histogram."""
     if not counts:

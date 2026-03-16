@@ -19,6 +19,7 @@ from compute_metrics import (
     metric1_per_item_variance,
     metric2_exact_agreement,
     metric3_score_histogram,
+    otel_metrics,
     variance,
 )
 from utils import ENCODING, REPO_ROOT, load_jsonl
@@ -67,13 +68,11 @@ if _css:
 st.title(_captions.get("title", "LLM-as-a-Judge Reliability & Execution Integrity"))
 
 # --- Tab structure ---
-tab_names = ["Overview", "Run Experiment", "View Results"]
-
+tab_names = ["Overview", "Run Experiment", "View Results", "Telemetry"]
 tab_names.append("Manage")
 tabs = st.tabs(tab_names)
 
-tab_overview, tab_run, tab_view = tabs[0], tabs[1], tabs[2]
-tab_otel = None  # TODO: tabs[3] when Telemetry exists
+tab_overview, tab_run, tab_view, tab_otel = tabs[0], tabs[1], tabs[2], tabs[3]
 tab_manage = tabs[-1]
 
 
@@ -230,12 +229,113 @@ with tab_run:
 
 
 # ==================== TAB 4: Telemetry (OTEL) ====================
+with tab_otel:
+    st.header("Telemetry (OTEL)")
+    st.caption(
+        "OpenTelemetry data from judge runs: trace/span IDs, token usage, and span status. "
+        "Used to validate reliability via token-based metrics."
+    )
+    jsonl_files = list(RESULTS_DIR.glob("*.jsonl")) if RESULTS_DIR.exists() else []
+    if not jsonl_files:
+        st.info("No result files. Run the judge pipeline to collect OTEL data.")
+    else:
+        selected = st.selectbox(
+            "Result file",
+            [f.name for f in jsonl_files],
+            key="otel_file",
+        )
+        path = RESULTS_DIR / selected
+        rows = load_jsonl(path)
+        if not rows:
+            st.info("File is empty.")
+        else:
+            otel = otel_metrics(rows)
+            if otel.get("has_otel"):
+                # ---- Section 1: Run overview ----
+                st.subheader("1. Run overview")
+                st.caption("Basic stats for this execution. Each API call = one span.")
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Total spans", otel["total_spans"])
+                with col2:
+                    st.metric("Span status OK", otel["span_status_ok"])
+                with col3:
+                    st.metric("Span status Error", otel["span_status_error"])
+                with col4:
+                    st.metric("Trace IDs", len(otel["trace_ids"]))
+                with st.expander("Trace IDs", expanded=False):
+                    for tid in otel.get("trace_ids", [])[:20]:
+                        st.code(tid, language=None)
+                    if len(otel.get("trace_ids", [])) > 20:
+                        st.caption(f"... and {len(otel['trace_ids']) - 20} more")
 
-if tab_otel:
-    with tab_otel:
-        # TODO: Sync with View Results 
-        st.header("Telemetry - OTEL")
-        st.info("TODO: Implement Telemetry tab")
+                if otel.get("total_input_tokens") is not None:
+                    # ---- Section 2: Across repeats of the same item (RELIABILITY) ----
+                    st.subheader("2. Across repeats of the same item")
+                    st.info(
+                        "**Reliability focus:** Same item, same prompt, K repeats—does the judge behave consistently? "
+                        "Output length can vary when the model words justifications differently. Low variance = more stable."
+                    )
+                    c1, c2, c3 = st.columns(3)
+                    tok_var = otel.get("mean_token_variance_per_item")
+                    with c1:
+                        st.metric("Token length variance (mean)", f"{tok_var:.2f}" if tok_var is not None else "—")
+                        st.caption("Lower = more consistent wording across repeats")
+                    with c2:
+                        st.metric("Total input tokens", f"{otel['total_input_tokens']:,}")
+                    with c3:
+                        st.metric("Total output tokens", f"{otel['total_output_tokens']:,}")
+                    # Per-item within-item variance (reliability detail)
+                    per_item = otel.get("per_item_token_details", [])
+                    if per_item:
+                        rel_df = pd.DataFrame([
+                            {"item_id": p["item_id"], "within_item_variance": p["within_item_variance"], "repeats": p["repeats"]}
+                            for p in per_item
+                        ])
+                        st.caption("Per-item: variance in token count across K repeats (0 = perfectly consistent).")
+                        st.dataframe(rel_df, use_container_width=True)
+
+                    # ---- Section 3: Across different items ----
+                    st.subheader("3. Across different items")
+                    st.caption(
+                        "Each item = different question & response. Different prompts → different token counts. "
+                        "This is expected, not a reliability signal."
+                    )
+                    if otel.get("between_item_range") is not None:
+                        bc1, bc2, bc3 = st.columns(3)
+                        with bc1:
+                            st.metric("Min tokens (per item)", f"{otel['between_item_min_tokens']:.0f}")
+                        with bc2:
+                            st.metric("Max tokens (per item)", f"{otel['between_item_max_tokens']:.0f}")
+                        with bc3:
+                            st.metric("Range (difference)", f"{otel['between_item_range']:.0f}")
+                    if per_item:
+                        item_df = pd.DataFrame(per_item)
+                        st.dataframe(item_df, use_container_width=True)
+                        chart_data = []
+                        for p in per_item:
+                            chart_data.append({"item_id": str(p["item_id"]), "tokens": p["mean_input_tokens"], "type": "Input (prompt)"})
+                            chart_data.append({"item_id": str(p["item_id"]), "tokens": p["mean_output_tokens"], "type": "Output (justification)"})
+                        tok_fig = px.bar(
+                            pd.DataFrame(chart_data),
+                            x="item_id",
+                            y="tokens",
+                            color="type",
+                            barmode="group",
+                            color_discrete_map={"Input (prompt)": "#606060", "Output (justification)": "#a0a0a0"},
+                        )
+                        tok_fig.update_layout(
+                            xaxis_title="Item",
+                            yaxis_title="Mean tokens",
+                            height=280,
+                            legend_title="Token type",
+                        )
+                        st.plotly_chart(tok_fig, use_container_width=True)
+            else:
+                st.info(
+                    "This file has no OTEL metadata (trace_id, input_tokens, etc.). "
+                    "Run the instrumented judge pipeline to collect OTEL data."
+                )
 
 
 # ==================== TAB 5: Manage ====================
