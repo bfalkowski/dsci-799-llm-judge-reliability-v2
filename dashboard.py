@@ -5,6 +5,7 @@ LLM-as-a-Judge Reliability Dashboard (STUB)
 
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import altair as alt
@@ -24,7 +25,6 @@ from compute_metrics import (
 )
 from utils import ENCODING, REPO_ROOT, load_jsonl
 RESULTS_DIR = REPO_ROOT / "results"
-DATA_DIR = REPO_ROOT / "data"
 CONTENT_DIR = REPO_ROOT / "dashboard_content"
 
 
@@ -230,7 +230,6 @@ with tab_compare:
         else:
             # Load each file and compute metrics
             compare_data = []
-            all_scores = []
             skipped = []
             for fname in selected:
                 path = RESULTS_DIR / fname
@@ -263,9 +262,6 @@ with tab_compare:
                     "% zero variance": round(m1["pct_items_zero_variance"], 1),
                     "Exact agreement": f"{m2['mean_agreement_rate']:.1%}",
                 })
-                counts = metric3_score_histogram(rows)
-                for score, cnt in counts.items():
-                    all_scores.append({"score": score, "judge": judge, "count": cnt})
 
             if skipped:
                 st.warning(f"Skipped (empty): {', '.join(skipped)}")
@@ -301,6 +297,94 @@ with tab_compare:
                 else:
                     st.info("No reliability data to chart (select files with valid judgments).")
 
+                # Score spread per item across judges
+                st.subheader("Score spread per item across judges")
+                st.caption(
+                    "Spread = max(score across judges) − min(score across judges). Higher = more disagreement. "
+                    "All compared files must share the same dataset (same item set)."
+                )
+                # Build item sets and mean scores per judge; validate same dataset across files
+                file_item_sets = {}
+                spread_by_item: dict = {}
+                for fname in selected:
+                    if fname in skipped:
+                        continue
+                    path = RESULTS_DIR / fname
+                    rows = load_jsonl(path)
+                    judge = rows[0].get("judge_model", fname.replace("mtbench_judge-", "").split("_K")[0]) if rows else fname
+                    by_item = _group_by_item(rows)
+                    item_ids = frozenset(by_item.keys())
+                    file_item_sets[fname] = (len(item_ids), item_ids)
+                    for item_id, scores in by_item.items():
+                        spread_by_item.setdefault(item_id, {})[judge] = sum(scores) / len(scores)
+                # Validate: same number of items and same item_ids across all files
+                spread_valid = len(file_item_sets) >= 2
+                if spread_valid:
+                    ref_count, ref_items = next(iter(file_item_sets.values()))
+                    for fname, (n, items) in file_item_sets.items():
+                        if n != ref_count or items != ref_items:
+                            spread_valid = False
+                            break
+                if not spread_valid or len(file_item_sets) < 2:
+                    st.warning(
+                        "All compared files must have the same number of items and represent the same dataset (frozen subset). "
+                        "Cannot compute spread across judges."
+                    )
+                else:
+                    # Compute spread per item: max - min across judges
+                    spread_rows = []
+                    for item_id, judge_scores in spread_by_item.items():
+                        if len(judge_scores) >= 2:
+                            all_means = list(judge_scores.values())
+                            mn, mx = min(all_means), max(all_means)
+                            spread = mx - mn
+                            spread_rows.append({
+                                "item_id": item_id,
+                                "spread": spread,
+                                "min_score": mn,
+                                "max_score": mx,
+                                "judge_scores": ", ".join(f"{j}: {s:.1f}" for j, s in sorted(judge_scores.items())),
+                            })
+                    if spread_rows:
+                        spread_df = pd.DataFrame(spread_rows).sort_values("spread", ascending=False)
+                        # Summary metrics
+                        mean_spread = spread_df["spread"].mean()
+                        pct_spread_ge2 = 100 * (spread_df["spread"] >= 2).sum() / len(spread_df)
+                        max_spread = spread_df["spread"].max()
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Mean spread", f"{mean_spread:.2f}")
+                        with col2:
+                            st.metric("% items with spread ≥ 2", f"{pct_spread_ge2:.1f}%")
+                        with col3:
+                            st.metric("Max spread", f"{max_spread:.0f}")
+                        # Bar chart: one bar per item, sorted by spread desc
+                        spread_fig = px.bar(
+                            spread_df,
+                            x="item_id",
+                            y="spread",
+                        )
+                        spread_fig.update_traces(
+                            marker_color="#808080",
+                            hovertemplate="<b>Item %{x}</b><br>Spread: %{y}<br>Min score: %{customdata[0]:.1f}<br>Max score: %{customdata[1]:.1f}<br>%{customdata[2]}<extra></extra>",
+                            customdata=spread_df[["min_score", "max_score", "judge_scores"]].values,
+                        )
+                        spread_fig.add_hline(y=2, line_color="#bbb", line_width=1)
+                        spread_fig.update_layout(
+                            xaxis_title="Item",
+                            yaxis_title="Spread",
+                            yaxis=dict(range=[0, 9]),
+                            height=400,
+                            showlegend=False,
+                            xaxis={"categoryorder": "array", "categoryarray": spread_df["item_id"].tolist()},
+                        )
+                        st.plotly_chart(spread_fig, use_container_width=True)
+                    else:
+                        st.info(
+                            "Need items scored by at least 2 judges. "
+                            "Ensure selected files share common item_ids (e.g. same dataset)."
+                        )
+
 
 # ==================== TAB 2: Run Experiment ==============
 with tab_run:
@@ -331,16 +415,26 @@ with tab_run:
             help="e.g. gpt-4o-mini (OpenAI) or claude-sonnet-4-20250514 (Anthropic)",
         )
     k_choice = st.selectbox("Repeats per item (K)", [2, 3, 5, 10], index=2, key="run_k")
+    dataset_choice = st.selectbox(
+        "Dataset",
+        ["Subset (5 items)", "Full (30 items)"],
+        key="run_dataset",
+        help="Subset = mt_bench_subset.json. Full = mt_bench_full.json (run build_mt_bench_full.py first if missing).",
+    )
+    input_path = REPO_ROOT / "data" / ("mt_bench_full.json" if "Full" in dataset_choice else "mt_bench_subset.json")
 
     if st.button("Run experiment", type="primary", key="run_btn"):
-        with st.spinner("Running experiment (calling judge API)..."):
-            try:
-                from run_repeated_judging import run_experiment
+        if "Full" in dataset_choice and not input_path.exists():
+            st.error("mt_bench_full.json not found. Run: python src/build_mt_bench_full.py")
+        else:
+            with st.spinner("Running experiment (calling judge API)..."):
+                try:
+                    from run_repeated_judging import run_experiment
 
-                out_path = run_experiment(judge_model=judge_choice, repeats=k_choice)
-                st.success(f"Done. Output: {out_path}")
-            except Exception as e:
-                st.error(str(e))
+                    out_path = run_experiment(judge_model=judge_choice, repeats=k_choice, input_path=str(input_path))
+                    st.success(f"Done. Output: {out_path}")
+                except Exception as e:
+                    st.error(str(e))
 
     st.divider()
     jsonl_files = list(RESULTS_DIR.glob("*.jsonl")) if RESULTS_DIR.exists() else []
@@ -468,7 +562,67 @@ with tab_otel:
 
 # ==================== TAB 6: Manage ====================
 with tab_manage:
-    # TODO: Delete experiments  
-    
     st.header("Manage")
-    st.info("TODO: Implement Manage tab..")
+    st.caption("View and delete result files from the results directory.")
+    jsonl_files = sorted(RESULTS_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True) if RESULTS_DIR.exists() else []
+    if not jsonl_files:
+        st.info("No result files.")
+    else:
+        # Build file table with record counts
+        file_info = []
+        for path in jsonl_files:
+            stat = path.stat()
+            try:
+                rows = load_jsonl(path)
+                n_records = len(rows)
+            except Exception:
+                n_records = 0
+            file_info.append({
+                "name": path.name,
+                "path": path,
+                "records": n_records,
+                "size_kb": round(stat.st_size / 1024, 1),
+                "mtime": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+            })
+        # Table with sticky header (st.data_editor provides it)
+        df = pd.DataFrame([
+            {"Delete": False, "File": f["name"], "Records": f["records"], "Size (KB)": f["size_kb"], "Modified": f["mtime"]}
+            for f in file_info
+        ])
+        edited = st.data_editor(
+            df,
+            column_config={
+                "Delete": st.column_config.CheckboxColumn("Delete", help="Select to delete", width="small"),
+                "File": st.column_config.TextColumn("File", width="large"),
+                "Records": st.column_config.NumberColumn("Records", width="small"),
+                "Size (KB)": st.column_config.NumberColumn("Size (KB)", width="small"),
+                "Modified": st.column_config.TextColumn("Modified", width="medium"),
+            },
+            disabled=["File", "Records", "Size (KB)", "Modified"],
+            hide_index=True,
+            use_container_width=True,
+            key="manage_file_editor",
+        )
+        to_delete = [f["path"] for f, row in zip(file_info, edited.itertuples(index=False)) if row.Delete]
+
+        st.divider()
+        confirm = False
+        if to_delete:
+            total_records = sum(f["records"] for f in file_info if f["path"] in to_delete)
+            st.warning(f"Selected {len(to_delete)} file(s) ({total_records} records total).")
+            confirm = st.checkbox("I confirm I want to delete these files", key="manage_confirm")
+        if st.button("Delete", type="primary", key="manage_delete_btn", disabled=len(to_delete) == 0):
+            if not confirm:
+                st.warning("Check the confirmation box to proceed.")
+            else:
+                errors = []
+                for path in to_delete:
+                    try:
+                        path.unlink()
+                    except Exception as e:
+                        errors.append(f"{path.name}: {e}")
+                for err in errors:
+                    st.error(err)
+                if not errors:
+                    st.success(f"Deleted {len(to_delete)} file(s).")
+                    st.rerun()
