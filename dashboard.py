@@ -212,9 +212,44 @@ with tab_view:
 # ==================== TAB 3: Run Experiment ==============
 with tab_run:
     st.header("Run Experiment")
-    st.info("TODO Implement Run Experiment form.")
 
-    # Show raw results (most recent) so you can see output format
+    judge_options = [
+        "gpt-4o-mini",
+        "gpt-4o",
+        "gpt-4",
+        "claude-sonnet-4-20250514",
+        "claude-opus-4-20250514",
+        "claude-haiku-4-5-20251001",
+        "claude-sonnet-4-6",
+        "Custom...",
+    ]
+    judge_choice = st.selectbox(
+        "Judge model",
+        judge_options,
+        index=0,
+        key="run_judge",
+        help="gpt-* → OpenAI; claude-* → Anthropic. Set OPENAI_API_KEY or ANTHROPIC_API_KEY in .env.",
+    )
+    if judge_choice == "Custom...":
+        judge_choice = st.text_input(
+            "Custom judge model",
+            value="gpt-4o-mini",
+            key="run_judge_custom",
+            help="e.g. gpt-4o-mini (OpenAI) or claude-sonnet-4-20250514 (Anthropic)",
+        )
+    k_choice = st.selectbox("Repeats per item (K)", [2, 3, 5, 10], index=2, key="run_k")
+
+    if st.button("Run experiment", type="primary", key="run_btn"):
+        with st.spinner("Running experiment (calling judge API)..."):
+            try:
+                from run_repeated_judging import run_experiment
+
+                out_path = run_experiment(judge_model=judge_choice, repeats=k_choice)
+                st.success(f"Done. Output: {out_path}")
+            except Exception as e:
+                st.error(str(e))
+
+    st.divider()
     jsonl_files = list(RESULTS_DIR.glob("*.jsonl")) if RESULTS_DIR.exists() else []
     if jsonl_files:
         latest = max(jsonl_files, key=lambda p: p.stat().st_mtime)

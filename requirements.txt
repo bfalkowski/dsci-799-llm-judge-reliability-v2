@@ -1,5 +1,6 @@
-# For LLM-as-a-judge and MT-Bench response generation (OpenAI). Required for experiments.
+# For LLM-as-a-judge and MT-Bench response generation (OpenAI and Anthropic). Required for experiments.
 openai>=1.0.0
+anthropic>=0.39.0
 # Load .env so OPENAI_API_KEY can be set in a file (not required if you export in the shell).
 python-dotenv>=1.0.0
 
