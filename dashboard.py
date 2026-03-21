@@ -68,11 +68,11 @@ if _css:
 st.title(_captions.get("title", "LLM-as-a-Judge Reliability & Execution Integrity"))
 
 # --- Tab structure ---
-tab_names = ["Overview", "Run Experiment", "View Results", "Telemetry"]
+tab_names = ["Overview", "Run Experiment", "View Results", "Compare Judges", "Telemetry"]
 tab_names.append("Manage")
 tabs = st.tabs(tab_names)
 
-tab_overview, tab_run, tab_view, tab_otel = tabs[0], tabs[1], tabs[2], tabs[3]
+tab_overview, tab_run, tab_view, tab_compare, tab_otel = tabs[0], tabs[1], tabs[2], tabs[3], tabs[4]
 tab_manage = tabs[-1]
 
 
@@ -209,7 +209,100 @@ with tab_view:
             st.info("File is empty.")
 
 
-# ==================== TAB 3: Run Experiment ==============
+# ==================== TAB 4: Compare Judges ==============
+with tab_compare:
+    st.header("Compare Judges")
+    st.caption(
+        "Select multiple result files to compare reliability metrics and score distributions across judges."
+    )
+    jsonl_files = list(RESULTS_DIR.glob("*.jsonl")) if RESULTS_DIR.exists() else []
+    if not jsonl_files:
+        st.info("No result files. Run experiments with different judges first.")
+    else:
+        selected = st.multiselect(
+            "Result files to compare (select 2 or more)",
+            [f.name for f in sorted(jsonl_files, key=lambda p: p.name)],
+            default=[],
+            key="compare_files",
+        )
+        if len(selected) < 2:
+            st.info("Select at least 2 files to compare.")
+        else:
+            # Load each file and compute metrics
+            compare_data = []
+            all_scores = []
+            skipped = []
+            for fname in selected:
+                path = RESULTS_DIR / fname
+                rows = load_jsonl(path)
+                if not rows:
+                    # Extract judge name from filename (mtbench_judge-XYZ_K...)
+                    judge = fname.replace("mtbench_judge-", "").split("_K")[0] if "mtbench_judge-" in fname else fname
+                    compare_data.append({
+                        "Judge": judge,
+                        "File": fname,
+                        "Items": 0,
+                        "Mean score": "—",
+                        "Mean variance": "—",
+                        "% zero variance": "—",
+                        "Exact agreement": "—",
+                    })
+                    skipped.append(fname)
+                    continue
+                judge = rows[0].get("judge_model", fname)
+                by_item = _group_by_item(rows)
+                m1 = metric1_per_item_variance(by_item)
+                m2 = metric2_exact_agreement(by_item)
+                mean_score = sum(s for scores in by_item.values() for s in scores) / sum(len(s) for s in by_item.values()) if by_item else 0
+                compare_data.append({
+                    "Judge": judge,
+                    "File": fname,
+                    "Items": m1["n_items"],
+                    "Mean score": round(mean_score, 2),
+                    "Mean variance": round(m1["mean_variance"], 4),
+                    "% zero variance": round(m1["pct_items_zero_variance"], 1),
+                    "Exact agreement": f"{m2['mean_agreement_rate']:.1%}",
+                })
+                counts = metric3_score_histogram(rows)
+                for score, cnt in counts.items():
+                    all_scores.append({"score": score, "judge": judge, "count": cnt})
+
+            if skipped:
+                st.warning(f"Skipped (empty): {', '.join(skipped)}")
+            if compare_data:
+                st.subheader("Per-judge metrics")
+                st.dataframe(pd.DataFrame(compare_data), use_container_width=True)
+
+                # Reliability chart: % zero variance (higher = more reliable)
+                rel_data = [
+                    {"judge": r["Judge"], "pct_zero_variance": r["% zero variance"]}
+                    for r in compare_data
+                    if isinstance(r["% zero variance"], (int, float))
+                ]
+                if rel_data:
+                    st.subheader("Reliability: % items with zero variance")
+                    st.caption("Higher = more stable. Same item, same response → identical scores across repeats.")
+                    rel_df = pd.DataFrame(rel_data)
+                    fig = px.bar(
+                        rel_df,
+                        x="pct_zero_variance",
+                        y="judge",
+                        orientation="h",
+                    )
+                    fig.update_traces(marker_color="#808080")
+                    fig.update_layout(
+                        xaxis_title="% zero variance",
+                        yaxis_title="",
+                        xaxis=dict(range=[0, 105]),
+                        height=max(200, 60 * len(rel_data)),
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No reliability data to chart (select files with valid judgments).")
+
+
+# ==================== TAB 2: Run Experiment ==============
 with tab_run:
     st.header("Run Experiment")
 
@@ -263,7 +356,7 @@ with tab_run:
 
 
 
-# ==================== TAB 4: Telemetry (OTEL) ====================
+# ==================== TAB 5: Telemetry (OTEL) ====================
 with tab_otel:
     st.header("Telemetry (OTEL)")
     st.caption(
@@ -373,7 +466,7 @@ with tab_otel:
                 )
 
 
-# ==================== TAB 5: Manage ====================
+# ==================== TAB 6: Manage ====================
 with tab_manage:
     # TODO: Delete experiments  
     

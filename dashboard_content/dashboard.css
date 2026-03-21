@@ -17,6 +17,36 @@ h1, h2, h3 {
     margin: 1rem 0 0.75rem 0;
     box-shadow: 0 2px 4px rgba(0,0,0,0.08);
 }
+/* Tabs: larger, easier to read */
 .stTabs [data-baseweb="tab-list"] {
-    gap: 0.5rem;
+    gap: 0.25rem;
+    background: #f1f5f9;
+    padding: 0.5rem 0.5rem 0 0.5rem;
+    border-radius: 0.5rem 0.5rem 0 0;
+    border-bottom: 2px solid #e2e8f0;
+}
+
+.stTabs button[role="tab"] {
+    font-size: 0.95rem !important;
+    font-weight: 500 !important;
+    padding: 0.75rem 1.25rem !important;
+    color: #475569 !important;
+    background: #e2e8f0 !important;
+    border: 1px solid #cbd5e1 !important;
+    border-bottom: none !important;
+    border-radius: 0.5rem 0.5rem 0 0 !important;
+}
+
+.stTabs button[role="tab"]:hover {
+    background: #cbd5e1 !important;
+    color: #334155 !important;
+}
+
+.stTabs button[role="tab"][aria-selected="true"] {
+    font-weight: 600 !important;
+    color: #0f172a !important;
+    background: white !important;
+    border-color: #94a3b8 !important;
+    box-shadow: 0 -2px 0 0 white;
+    margin-bottom: -2px;
 }

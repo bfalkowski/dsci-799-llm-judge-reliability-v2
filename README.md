@@ -90,6 +90,7 @@ Then use the URL Streamlit prints, or your host's forwarded port (e.g. `https://
 
 - **Overview** – project stages and goals
 - **Run Experiment** – select judge model, K repeats, run the pipeline
-- **View Results** – reliability metrics, charts, score distribution
+- **View Results** – reliability metrics, charts, score distribution (single file)
+- **Compare Judges** – select 2+ result files to compare metrics and score distributions across judges
 - **Telemetry** – OTEL token usage, span status, per-item variance
 - **Manage** – experiment management (placeholder)
