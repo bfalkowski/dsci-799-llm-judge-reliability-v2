@@ -27,6 +27,17 @@ from utils import ENCODING, REPO_ROOT, load_jsonl
 RESULTS_DIR = REPO_ROOT / "results"
 CONTENT_DIR = REPO_ROOT / "dashboard_content"
 
+# Curated judge LLMs for experiments (3 OpenAI + 4 Anthropic). Edit here to change the roster.
+JUDGE_MODEL_ROSTER = [
+    {"model_id": "gpt-4o-mini", "provider": "OpenAI", "note": "Fast, low cost"},
+    {"model_id": "gpt-4o", "provider": "OpenAI", "note": "Flagship multimodal"},
+    {"model_id": "gpt-4", "provider": "OpenAI", "note": "GPT-4 class"},
+    {"model_id": "claude-sonnet-4-20250514", "provider": "Anthropic", "note": "Claude Sonnet (dated snapshot)"},
+    {"model_id": "claude-opus-4-20250514", "provider": "Anthropic", "note": "Claude Opus"},
+    {"model_id": "claude-haiku-4-5-20251001", "provider": "Anthropic", "note": "Claude Haiku"},
+    {"model_id": "claude-sonnet-4-6", "provider": "Anthropic", "note": "Claude Sonnet 4.6"},
+]
+
 
 def _load_content(name, ext="md"):
     """Load text from dashboard_content/{name}.{ext}. Returns empty string if missing."""
@@ -68,12 +79,26 @@ if _css:
 st.title(_captions.get("title", "LLM-as-a-Judge Reliability & Execution Integrity"))
 
 # --- Tab structure ---
-tab_names = ["Overview", "Run Experiment", "View Results", "Compare Judges", "Telemetry"]
-tab_names.append("Manage")
+tab_names = [
+    "Overview",
+    "Judge models",
+    "Run Experiment",
+    "View Results",
+    "Compare Judges",
+    "Telemetry",
+    "Manage",
+]
 tabs = st.tabs(tab_names)
 
-tab_overview, tab_run, tab_view, tab_compare, tab_otel = tabs[0], tabs[1], tabs[2], tabs[3], tabs[4]
-tab_manage = tabs[-1]
+tab_overview, tab_judges, tab_run, tab_view, tab_compare, tab_otel, tab_manage = (
+    tabs[0],
+    tabs[1],
+    tabs[2],
+    tabs[3],
+    tabs[4],
+    tabs[5],
+    tabs[6],
+)
 
 
 # ==================== TAB 1:  Overview ====================
@@ -87,6 +112,27 @@ with tab_overview:
     else:
         st.info("Overview content not found. Create dashboard_content/overview.md.")
     st.caption(_captions.get("overview_footer", ""))
+
+
+# ==================== TAB: Judge models (LLM roster) ====================
+with tab_judges:
+    st.header("Judge models")
+    st.caption(
+        "These are the LLM judges used in experiments. Names starting with gpt-* call OpenAI; "
+        "claude-* call Anthropic. Set API keys in `.env`."
+    )
+    roster_df = pd.DataFrame(JUDGE_MODEL_ROSTER)
+    roster_df.insert(0, "#", range(1, len(roster_df) + 1))
+    st.dataframe(roster_df, use_container_width=True, hide_index=True)
+    with st.expander("Routing (for your paper or methods)", expanded=False):
+        st.markdown(
+            "- **OpenAI:** `OPENAI_API_KEY` — models `gpt-4o-mini`, `gpt-4o`, `gpt-4`, or any `gpt-*` id.\n"
+            "- **Anthropic:** `ANTHROPIC_API_KEY` — models `claude-*` ids as listed above.\n"
+            "- To add or retire a judge, edit `JUDGE_MODEL_ROSTER` in `dashboard.py` (and use **Custom...** on Run for one-off ids)."
+        )
+    st.info(
+        "Run Experiment uses this list in the judge dropdown. Compare Judges compares result files produced by these (or custom) models."
+    )
 
 
 # ==================== TAB 2: View Results ====================
@@ -390,16 +436,7 @@ with tab_compare:
 with tab_run:
     st.header("Run Experiment")
 
-    judge_options = [
-        "gpt-4o-mini",
-        "gpt-4o",
-        "gpt-4",
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250514",
-        "claude-haiku-4-5-20251001",
-        "claude-sonnet-4-6",
-        "Custom...",
-    ]
+    judge_options = [row["model_id"] for row in JUDGE_MODEL_ROSTER] + ["Custom..."]
     judge_choice = st.selectbox(
         "Judge model",
         judge_options,
