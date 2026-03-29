@@ -89,8 +89,9 @@ Then use the URL Streamlit prints, or your host's forwarded port (e.g. `https://
 ## Dashboard Tabs
 
 - **Overview** – project stages and goals
+- **Dataset & prompts** – view/edit `mt_bench*.json`, per-item `judge_instructions`, prompt preview
 - **Run Experiment** – select judge model, K repeats, run the pipeline
 - **View Results** – reliability metrics, charts, score distribution (single file)
 - **Compare Judges** – select 2+ result files to compare metrics and score distributions across judges
 - **Telemetry** – OTEL token usage, span status, per-item variance
-- **Manage** – experiment management (placeholder)
+- **Manage** – list and delete result files

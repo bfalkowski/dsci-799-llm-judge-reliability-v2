@@ -18,8 +18,8 @@ example:
     "justification" : "The is correct for the following reason..."
 }}
 
-Question:
-<{question}>
+{item_specific_rubric}Question:
+{question}
 
 Response:
-<{response}>
+{response}

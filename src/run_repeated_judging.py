@@ -77,9 +77,19 @@ def run_experiment(judge_model=None, repeats=None, input_path=None, max_items=No
                 item_id = item["item_id"]
                 question = item["question"]
                 response = item["response"]
+                raw_instr = (item.get("judge_instructions") or "").strip()
+                item_specific_rubric = (
+                    f"Item-specific judge instructions:\n{raw_instr}\n\n"
+                    if raw_instr
+                    else ""
+                )
 
                 for idx in range(k):
-                    prompt = judge_template.format(question=question, response=response)
+                    prompt = judge_template.format(
+                        question=question,
+                        response=response,
+                        item_specific_rubric=item_specific_rubric,
+                    )
 
                     with tracer.start_as_current_span("judge_evaluate") as span:
                         span.set_attribute("item_id", str(item_id))
@@ -120,6 +130,7 @@ def run_experiment(judge_model=None, repeats=None, input_path=None, max_items=No
                         "span_id": span_id,
                         "item_id": item_id,
                         "idx": idx,
+                        "judge_instructions": raw_instr if raw_instr else None,
                         "judge_model": model,
                         "score": score,
                         "justification": justification,

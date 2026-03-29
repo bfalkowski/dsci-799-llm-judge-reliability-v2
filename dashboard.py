@@ -25,7 +25,33 @@ from compute_metrics import (
 )
 from utils import ENCODING, REPO_ROOT, load_jsonl
 RESULTS_DIR = REPO_ROOT / "results"
+DATA_DIR = REPO_ROOT / "data"
 CONTENT_DIR = REPO_ROOT / "dashboard_content"
+
+
+def _normalize_judge_dataset(data):
+    """Ensure each row has item_id, question, response, judge_instructions."""
+    if not isinstance(data, list):
+        raise ValueError("Dataset file must contain a JSON array of objects.")
+    out = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        if "item_id" not in row or "question" not in row or "response" not in row:
+            continue
+        out.append({
+            "item_id": str(row["item_id"]),
+            "question": str(row.get("question", "")),
+            "response": str(row.get("response", "")),
+            "judge_instructions": str(row.get("judge_instructions", "") or ""),
+        })
+    return out
+
+
+def _discover_dataset_paths():
+    if not DATA_DIR.exists():
+        return []
+    return sorted(DATA_DIR.glob("mt_bench*.json"), key=lambda p: p.name)
 
 
 def _load_content(name, ext="md"):
@@ -68,12 +94,26 @@ if _css:
 st.title(_captions.get("title", "LLM-as-a-Judge Reliability & Execution Integrity"))
 
 # --- Tab structure ---
-tab_names = ["Overview", "Run Experiment", "View Results", "Compare Judges", "Telemetry"]
-tab_names.append("Manage")
+tab_names = [
+    "Overview",
+    "Dataset & prompts",
+    "Run Experiment",
+    "View Results",
+    "Compare Judges",
+    "Telemetry",
+    "Manage",
+]
 tabs = st.tabs(tab_names)
 
-tab_overview, tab_run, tab_view, tab_compare, tab_otel = tabs[0], tabs[1], tabs[2], tabs[3], tabs[4]
-tab_manage = tabs[-1]
+tab_overview, tab_dataset, tab_run, tab_view, tab_compare, tab_otel, tab_manage = (
+    tabs[0],
+    tabs[1],
+    tabs[2],
+    tabs[3],
+    tabs[4],
+    tabs[5],
+    tabs[6],
+)
 
 
 # ==================== TAB 1:  Overview ====================
@@ -87,6 +127,106 @@ with tab_overview:
     else:
         st.info("Overview content not found. Create dashboard_content/overview.md.")
     st.caption(_captions.get("overview_footer", ""))
+
+
+# ==================== TAB: Dataset & prompts ====================
+with tab_dataset:
+    st.header("Dataset & prompts")
+    st.caption(
+        "View and edit the judge dataset JSON. Each item can include **judge_instructions** "
+        "(per-item custom rubric for condition C). Empty instructions = generic prompt only."
+    )
+    paths = _discover_dataset_paths()
+    if not paths:
+        st.warning(f"No `mt_bench*.json` files in `{DATA_DIR}`. Add `mt_bench_subset.json` or run `build_mt_bench_full.py`.")
+    else:
+        labels = [p.name for p in paths]
+        choice = st.selectbox("Dataset file", labels, key="dataset_file_select")
+        data_path = DATA_DIR / choice
+
+        try:
+            raw = data_path.read_text(encoding=ENCODING)
+        except Exception as e:
+            st.error(str(e))
+        else:
+            try:
+                records = _normalize_judge_dataset(json.loads(raw))
+            except (json.JSONDecodeError, ValueError) as e:
+                st.error(f"Invalid dataset: {e}")
+            else:
+                if not records:
+                    st.info("No valid items in file.")
+                else:
+                    st.caption(f"`{data_path.relative_to(REPO_ROOT)}` — {len(records)} items")
+
+                    df = pd.DataFrame(records)
+                    edited = st.data_editor(
+                        df,
+                        column_config={
+                            "item_id": st.column_config.TextColumn("item_id", disabled=True, width="small"),
+                            "question": st.column_config.TextColumn("question", disabled=True, width="large"),
+                            "response": st.column_config.TextColumn("response", disabled=True, width="large"),
+                            "judge_instructions": st.column_config.TextColumn(
+                                "judge_instructions",
+                                help="Per-item instructions prepended to the judge prompt when non-empty.",
+                                width="large",
+                            ),
+                        },
+                        hide_index=True,
+                        use_container_width=True,
+                        key="dataset_prompts_editor",
+                        num_rows="fixed",
+                    )
+
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("Save changes to file", type="primary", key="dataset_save_btn"):
+                            to_save = []
+                            for _, row in edited.iterrows():
+                                to_save.append({
+                                    "item_id": str(row["item_id"]),
+                                    "question": str(row["question"]),
+                                    "response": str(row["response"]),
+                                    "judge_instructions": str(row.get("judge_instructions", "") or ""),
+                                })
+                            try:
+                                data_path.write_text(
+                                    json.dumps(to_save, indent=2, ensure_ascii=False) + "\n",
+                                    encoding=ENCODING,
+                                )
+                                st.success(f"Saved {len(to_save)} items to {data_path.name}")
+                            except Exception as e:
+                                st.error(str(e))
+
+                    with c2:
+                        st.caption("Commit saved files in git so runs stay reproducible.")
+
+                    st.subheader("Prompt preview")
+                    from run_repeated_judging import load_judge_prompt
+
+                    tmpl = load_judge_prompt()
+                    preview_ids = [str(r["item_id"]) for r in records]
+                    pick = st.selectbox("Item", preview_ids, key="dataset_preview_item")
+                    preview_row = next((r for r in records if str(r["item_id"]) == pick), None)
+                    if preview_row:
+                        # Use editor values if user changed them but didn’t save — align with current dataframe
+                        erow = edited[edited["item_id"].astype(str) == pick].iloc[0]
+                        q, resp = str(erow["question"]), str(erow["response"])
+                        raw_instr = str(erow.get("judge_instructions", "") or "").strip()
+                        rubric = (
+                            f"Item-specific judge instructions:\n{raw_instr}\n\n"
+                            if raw_instr
+                            else ""
+                        )
+                        try:
+                            filled = tmpl.format(
+                                question=q,
+                                response=resp,
+                                item_specific_rubric=rubric,
+                            )
+                        except KeyError as e:
+                            filled = f"(Template missing placeholder: {e})"
+                        st.code(filled, language=None)
 
 
 # ==================== TAB 2: View Results ====================
