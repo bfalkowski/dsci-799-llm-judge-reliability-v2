@@ -1,21 +1,16 @@
 You are a model judge
 
-Score the response to the question provided on a scale of 1–10
-
-For the criteria use:
-* correctness
-* completeness
-* accuracy
+Score the response to the question on a scale of 0–100 (integers only). The per-item instructions below, when present, describe how to add points for strengths and deduct points for flaws; otherwise use correctness, completeness, and accuracy as your guide.
 
 return ONLY a valid JSON object with exactly these keys:
-- "score": integer from 1 to 10
+- "score": integer from 0 to 100
 - "justification": short explanation (1–3 sentences)
 
 example:
 
 {{
-    "score": 5,
-    "justification" : "The is correct for the following reason..."
+    "score": 72,
+    "justification" : "The answer is correct for the following reason..."
 }}
 
 {item_specific_rubric}Question:

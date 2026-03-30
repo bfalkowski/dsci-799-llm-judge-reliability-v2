@@ -23,8 +23,23 @@ JUDGE_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "judge_prompt.
 REPEATS = 5
 TEMPERATURE = 0.0
 
+# Judging conditions (Phase 1 metadata); filenames use short slug
+CONDITION_FILENAME_SLUG = {
+    "generic_overall": "gen",
+    "metric_rubric": "metric",
+    "per_item_custom": "custom",
+}
+DEFAULT_CONDITION_NAME = "generic_overall"
+# Metadata score range; must match judge_prompt / JUDGE_RESPONSE_SCHEMA
+DEFAULT_SCORE_MIN = 0
+DEFAULT_SCORE_MAX = 100
+
 # ----------------------------
 logger = logging.getLogger(__name__)
+
+
+def _condition_slug(name: str) -> str:
+    return CONDITION_FILENAME_SLUG.get(name, name.replace("_", "")[:12])
 
 def load_judge_prompt() -> str:
     """Load judge prompt ..."""
@@ -36,11 +51,26 @@ def load_dataset(path: Path):
         return json.load(f)
 
 
-def run_experiment(judge_model=None, repeats=None, input_path=None, max_items=None, temperature=None):
+def run_experiment(
+    judge_model=None,
+    repeats=None,
+    input_path=None,
+    max_items=None,
+    temperature=None,
+    condition_name=None,
+    metric_name=None,
+    score_min=None,
+    score_max=None,
+    dataset_id=None,
+):
     """
     Run repeated judging. Accepts optional overrides; otherwise uses env/defaults.
     max_items: limit to first N items (for quick tests).
     temperature: sampling temperature; default from env TEMPERATURE or TEMPERATURE constant (0.0).
+    condition_name: generic_overall | metric_rubric | per_item_custom (env CONDITION_NAME).
+    metric_name: for B2 metric-rubric runs; null in JSONL when unused.
+    score_min, score_max: declared scale in output metadata (defaults 0–100).
+    dataset_id: logical dataset id; default = input file stem (e.g. mt_bench_subset).
     Returns path to output file on success.
     """
     load_dotenv(REPO_ROOT / ".env")
@@ -52,6 +82,11 @@ def run_experiment(judge_model=None, repeats=None, input_path=None, max_items=No
         else float(os.environ.get("TEMPERATURE", str(TEMPERATURE)))
     )
     data_path = Path(input_path) if input_path else INPUT_PATH
+    cond = (condition_name or os.environ.get("CONDITION_NAME") or DEFAULT_CONDITION_NAME).strip()
+    metric = (metric_name or os.environ.get("METRIC_NAME") or "").strip() or None
+    smin = int(score_min) if score_min is not None else int(os.environ.get("SCORE_MIN", str(DEFAULT_SCORE_MIN)))
+    smax = int(score_max) if score_max is not None else int(os.environ.get("SCORE_MAX", str(DEFAULT_SCORE_MAX)))
+    dset_id = (dataset_id or os.environ.get("DATASET_ID") or data_path.stem).strip()
 
     if is_claude_model(model):
         if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
@@ -69,7 +104,12 @@ def run_experiment(judge_model=None, repeats=None, input_path=None, max_items=No
     execution_id = str(uuid.uuid4())
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
     t_tag = str(temp).replace(".", "p") if "." in str(temp) else str(temp)
-    output_path = REPO_ROOT / "results" / f"mtbench_judge-{model.replace('/', '_')}_K{k}_t{t_tag}_{timestamp}.jsonl"
+    cond_slug = _condition_slug(cond)
+    output_path = (
+        REPO_ROOT
+        / "results"
+        / f"mtbench_judge-{model.replace('/', '_')}_cond-{cond_slug}_K{k}_t{t_tag}_{timestamp}.jsonl"
+    )
     print(f"Execution ID: {execution_id}")
 
     with tracer.start_as_current_span("judge_execution") as exec_span:
@@ -77,6 +117,12 @@ def run_experiment(judge_model=None, repeats=None, input_path=None, max_items=No
         exec_span.set_attribute("gen_ai.request.model", model)
         exec_span.set_attribute("item_count", len(dataset))
         exec_span.set_attribute("repeats", k)
+        exec_span.set_attribute("condition_name", cond)
+        exec_span.set_attribute("dataset_id", dset_id)
+        exec_span.set_attribute("score_min", smin)
+        exec_span.set_attribute("score_max", smax)
+        if metric:
+            exec_span.set_attribute("metric_name", metric)
 
         with output_path.open("w", encoding="utf-8") as out_file:
 
@@ -85,6 +131,8 @@ def run_experiment(judge_model=None, repeats=None, input_path=None, max_items=No
                 question = item["question"]
                 response = item["response"]
                 raw_instr = (item.get("judge_instructions") or "").strip()
+                if cond == "generic_overall":
+                    raw_instr = ""
                 item_specific_rubric = (
                     f"Item-specific judge instructions:\n{raw_instr}\n\n"
                     if raw_instr
@@ -118,8 +166,9 @@ def run_experiment(judge_model=None, repeats=None, input_path=None, max_items=No
                             parsed = json.loads(raw_output)
                         except json.JSONDecodeError:
                             parsed = extract_json_from_text(raw_output)
-                        if parsed and isinstance(parsed.get("score"), int) and 1 <= parsed.get("score", 0) <= 10:
-                            score = int(parsed["score"])
+                        sc = parsed.get("score") if parsed else None
+                        if parsed and isinstance(sc, int) and smin <= sc <= smax:
+                            score = int(sc)
                             justification = str(parsed.get("justification", ""))
                             span.set_attribute("gen_ai.response.score", score)
                             span.set_status(trace.Status(trace.StatusCode.OK))
@@ -140,6 +189,12 @@ def run_experiment(judge_model=None, repeats=None, input_path=None, max_items=No
                         "span_id": span_id,
                         "item_id": item_id,
                         "idx": idx,
+                        "condition_name": cond,
+                        "metric_name": metric,
+                        "dataset_id": dset_id,
+                        "score_min": smin,
+                        "score_max": smax,
+                        "temperature": temp,
                         "judge_instructions": raw_instr if raw_instr else None,
                         "judge_model": model,
                         "score": score,

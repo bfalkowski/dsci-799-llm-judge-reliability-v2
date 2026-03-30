@@ -4,9 +4,14 @@ LLM-as-a-Judge Reliability Dashboard (STUB)
 """
 
 import json
+import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
+
+from dotenv import load_dotenv
 
 import altair as alt
 import pandas as pd
@@ -15,6 +20,9 @@ import streamlit as st
 
 # Allow importing from src when dashboard runs from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+from constants import JUDGE_MODEL
+from judge import build_rubric_generator_user_prompt, call_text_model, is_claude_model
+from run_repeated_judging import CONDITION_FILENAME_SLUG
 from compute_metrics import (
     _group_by_item,
     metric1_per_item_variance,
@@ -27,6 +35,56 @@ from utils import ENCODING, REPO_ROOT, load_jsonl
 RESULTS_DIR = REPO_ROOT / "results"
 DATA_DIR = REPO_ROOT / "data"
 CONTENT_DIR = REPO_ROOT / "dashboard_content"
+
+# Filename slug → condition_name (matches run_repeated_judging.CONDITION_FILENAME_SLUG)
+_COND_SLUG_TO_NAME = {
+    "gen": "generic_overall",
+    "metric": "metric_rubric",
+    "custom": "per_item_custom",
+}
+
+
+def _first_jsonl_row(path: Path) -> dict:
+    try:
+        with path.open(encoding=ENCODING) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    return json.loads(line)
+    except Exception:
+        pass
+    return {}
+
+
+def _condition_label_for_file(path: Path, first_row: Optional[dict] = None) -> str:
+    row = first_row if first_row is not None else _first_jsonl_row(path)
+    c = row.get("condition_name")
+    if c and isinstance(c, str) and c.strip():
+        return c.strip()
+    m = re.search(r"_cond-([^_]+)_", path.name)
+    if m:
+        slug = m.group(1)
+        return _COND_SLUG_TO_NAME.get(slug, slug)
+    return "(legacy — not in filename or rows)"
+
+
+def _summarize_result_file(path: Path) -> dict:
+    row = _first_jsonl_row(path)
+    return {
+        "path": path,
+        "name": path.name,
+        "condition": _condition_label_for_file(path, row),
+        "dataset_id": (str(row.get("dataset_id") or "").strip() or "—"),
+        "judge_model": str(row.get("judge_model") or "—"),
+        "metric_name": row.get("metric_name"),
+    }
+
+
+def _all_result_summaries() -> list:
+    if not RESULTS_DIR.exists():
+        return []
+    out = [_summarize_result_file(p) for p in sorted(RESULTS_DIR.glob("*.jsonl"), key=lambda p: p.name)]
+    return out
 
 
 def _normalize_judge_dataset(data):
@@ -75,6 +133,19 @@ def _load_captions():
 
 
 _captions = _load_captions()
+load_dotenv(REPO_ROOT / ".env", override=False)
+
+# Preset judge / rubric-generator models (gpt-* → OpenAI, claude-* → Anthropic)
+JUDGE_MODEL_PRESETS = [
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-4",
+    "claude-sonnet-4-20250514",
+    "claude-opus-4-20250514",
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-6",
+    "Custom...",
+]
 
 
 # --- Page config and title ---
@@ -158,6 +229,12 @@ with tab_dataset:
                     st.info("No valid items in file.")
                 else:
                     st.caption(f"`{data_path.relative_to(REPO_ROOT)}` — {len(records)} items")
+                    _fb = st.session_state.pop("dataset_rubric_feedback", None)
+                    if _fb:
+                        if _fb.get("success"):
+                            st.success(_fb["success"])
+                        if _fb.get("warning"):
+                            st.warning(_fb["warning"])
 
                     df = pd.DataFrame(records)
                     edited = st.data_editor(
@@ -201,6 +278,97 @@ with tab_dataset:
                     with c2:
                         st.caption("Commit saved files in git so runs stay reproducible.")
 
+                    st.divider()
+                    st.subheader("Generate custom judge instructions")
+                    st.caption(
+                        "One API call per row using the question and reference response. Fills **judge_instructions** "
+                        "with add/deduct scoring guidance for a 0–100 scale. **Re-run overwrites** every row; the file is saved when finished."
+                    )
+                    rg1, rg2 = st.columns([3, 1])
+                    with rg1:
+                        _preset_ids = [p for p in JUDGE_MODEL_PRESETS if p != "Custom..."]
+                        _env_m = (os.environ.get("JUDGE_MODEL") or JUDGE_MODEL).strip()
+                        _rubric_idx = (
+                            JUDGE_MODEL_PRESETS.index(_env_m)
+                            if _env_m in _preset_ids
+                            else JUDGE_MODEL_PRESETS.index("Custom...")
+                        )
+                        rubric_model_pick = st.selectbox(
+                            "Model for rubric generation",
+                            JUDGE_MODEL_PRESETS,
+                            index=_rubric_idx,
+                            key="rubric_gen_model_select",
+                            help="Pick a preset or **Custom...** to type any model id (independent of the Run Experiment judge).",
+                        )
+                        if rubric_model_pick == "Custom...":
+                            gen_model = st.text_input(
+                                "Custom rubric model id",
+                                value=_env_m if _env_m not in _preset_ids else "gpt-4o-mini",
+                                key="rubric_gen_model_custom",
+                                help="Any OpenAI or Anthropic model string your account supports.",
+                            ).strip()
+                        else:
+                            gen_model = rubric_model_pick
+                    with rg2:
+                        gen_temp = st.slider("Temp", 0.0, 1.0, 0.2, 0.05, key="rubric_gen_temp")
+                    if st.button(
+                        "Generate / overwrite custom judges for all items",
+                        type="secondary",
+                        key="rubric_gen_btn",
+                    ):
+                        load_dotenv(REPO_ROOT / ".env", override=False)
+                        model_id = (gen_model or "").strip() or JUDGE_MODEL
+                        key_name = "ANTHROPIC_API_KEY" if is_claude_model(model_id) else "OPENAI_API_KEY"
+                        if not (os.environ.get(key_name) or "").strip():
+                            st.error(f"{key_name} is not set. Add it to .env for {model_id}.")
+                        else:
+                            to_save = []
+                            errors = []
+                            n_items = len(edited)
+                            prog = st.progress(0.0, text="Starting…")
+                            for j, (_, row) in enumerate(edited.iterrows()):
+                                q = str(row["question"])
+                                resp = str(row["response"])
+                                item_id = str(row["item_id"])
+                                try:
+                                    up = build_rubric_generator_user_prompt(q, resp)
+                                    text, _, _ = call_text_model(
+                                        up, model_id, temperature=float(gen_temp)
+                                    )
+                                    instr = (text or "").strip()
+                                except Exception as e:
+                                    errors.append((item_id, str(e)))
+                                    instr = str(row.get("judge_instructions", "") or "")
+                                to_save.append({
+                                    "item_id": item_id,
+                                    "question": q,
+                                    "response": resp,
+                                    "judge_instructions": instr,
+                                })
+                                prog.progress(
+                                    (j + 1) / max(n_items, 1),
+                                    text=f"Generated {j + 1} / {n_items}",
+                                )
+                            try:
+                                data_path.write_text(
+                                    json.dumps(to_save, indent=2, ensure_ascii=False) + "\n",
+                                    encoding=ENCODING,
+                                )
+                            except Exception as e:
+                                st.error(str(e))
+                            else:
+                                fb = {
+                                    "success": f"Wrote {len(to_save)} items to {data_path.name} (model {model_id}).",
+                                }
+                                if errors:
+                                    preview = "; ".join(f"{iid}: {msg[:80]}" for iid, msg in errors[:5])
+                                    more = f" (+{len(errors) - 5} more)" if len(errors) > 5 else ""
+                                    fb["warning"] = (
+                                        f"{len(errors)} item(s) failed (previous instructions kept): {preview}{more}"
+                                    )
+                                st.session_state["dataset_rubric_feedback"] = fb
+                                st.rerun()
+
                     st.subheader("Prompt preview")
                     from run_repeated_judging import load_judge_prompt
 
@@ -231,140 +399,213 @@ with tab_dataset:
 
 # ==================== TAB 2: View Results ====================
 with tab_view:
-    jsonl_files = list(RESULTS_DIR.glob("*.jsonl")) if RESULTS_DIR.exists() else []
-    if not jsonl_files:
+    summaries = _all_result_summaries()
+    if not summaries:
         st.info("No result files in results")
     else:
-        selected = st.selectbox("Result file", [f.name for f in jsonl_files], key="view_results_file")
-        path = RESULTS_DIR / selected
-        rows = load_jsonl(path)
-        if rows:
-            df = pd.DataFrame(rows)
-            by_item = _group_by_item(rows)
-            m1 = metric1_per_item_variance(by_item)
-            m2 = metric2_exact_agreement(by_item)
-            counts = metric3_score_histogram(rows)
+        st.caption(
+            "Filter by **condition** and **dataset** so you only see runs from one experiment design at a time "
+            "(new runs log `condition_name` on every row and encode `_cond-gen|metric|custom_` in the filename)."
+        )
+        cond_values = sorted({s["condition"] for s in summaries}, key=str)
+        cond_filter = st.selectbox(
+            "Condition",
+            ["(all)"] + cond_values,
+            key="view_filter_condition",
+            help="generic_overall = no per-item rubric in prompt; per_item_custom = uses judge_instructions; metric_rubric = metric slice.",
+        )
+        dset_candidates = sorted(
+            {s["dataset_id"] for s in summaries if cond_filter == "(all)" or s["condition"] == cond_filter},
+            key=str,
+        )
+        dset_filter = st.selectbox(
+            "Dataset",
+            ["(all)"] + dset_candidates,
+            key="view_filter_dataset",
+        )
 
-            # Metrics section
-            st.subheader("Reliability metrics")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Mean variance", f"{m1['mean_variance']:.4f}")
-                st.caption("Per-item score variance across K runs")
-            with col2:
-                st.metric("% zero variance", f"{m1['pct_items_zero_variance']:.1f}%")
-                st.caption(f"{m1['zero_var_count']} / {m1['n_items']} items")
-            with col3:
-                st.metric("Exact agreement", f"{m2['mean_agreement_rate']:.1%}")
-                st.caption("Mean pairwise score match rate")
+        def _view_pick(s):
+            if cond_filter != "(all)" and s["condition"] != cond_filter:
+                return False
+            if dset_filter != "(all)" and s["dataset_id"] != dset_filter:
+                return False
+            return True
 
-            # Overall reliability: stable vs unstable
-            st.subheader("Overall reliability")
-            st.caption(
-                "Non-zero variance = judge instability (same response, different scores across repeats)."
-            )
-            var_data = [{"item_id": i, "variance": variance(s)} for i, s in by_item.items()]
-            if var_data:
-                stable = sum(1 for v in var_data if v["variance"] == 0)
-                unstable = len(var_data) - stable
-                summary_df = pd.DataFrame([
-                    {"status": "Stable (0 variance)", "items": stable},
-                    {"status": "Unstable (>0 variance)", "items": unstable},
-                ])
-                col1, col2 = st.columns(2)
+        filtered = [s for s in summaries if _view_pick(s)]
+        if not filtered:
+            st.warning("No files match these filters.")
+        else:
+            labels = [
+                f"{s['name']}  ·  {s['condition']}  ·  {s['dataset_id']}  ·  {s['judge_model']}"
+                for s in filtered
+            ]
+            label_to_name = {labels[i]: filtered[i]["name"] for i in range(len(filtered))}
+            pick_label = st.selectbox("Result file", labels, key="view_results_file_pick")
+            selected = label_to_name[pick_label]
+            path = RESULTS_DIR / selected
+            rows = load_jsonl(path)
+            if rows:
+                df = pd.DataFrame(rows)
+                by_item = _group_by_item(rows)
+                m1 = metric1_per_item_variance(by_item)
+                m2 = metric2_exact_agreement(by_item)
+                counts = metric3_score_histogram(rows)
+    
+                # Metrics section
+                st.subheader("Reliability metrics")
+                col1, col2, col3 = st.columns(3)
                 with col1:
-                    fig = px.bar(
-                        summary_df,
-                        x="items",
-                        y="status",
-                        orientation="h",
-                        color="status",
-                        color_discrete_map={
-                            "Stable (0 variance)": "#808080",
-                            "Unstable (>0 variance)": "#808080",
-                        },
-                        pattern_shape="status",
-                        pattern_shape_map={
-                            "Stable (0 variance)": "",
-                            "Unstable (>0 variance)": "/",
-                        },
-                    )
-                    fig.update_layout(
-                        xaxis_title="Number of items",
-                        yaxis_title="",
-                        height=280,
-                        showlegend=False,
-                        margin=dict(t=20, b=40),
-                    )
-                    fig.update_traces(marker_pattern_fillmode="overlay")
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.metric("Mean variance", f"{m1['mean_variance']:.4f}")
+                    st.caption("Per-item score variance across K runs")
                 with col2:
-                    # Variance distribution: how many items fall in each variance bucket
-                    var_df = pd.DataFrame(var_data)
-                    var_df["bucket"] = pd.cut(
-                        var_df["variance"],
-                        bins=[-0.1, 0, 0.25, 0.5, 1.0, 10],
-                        labels=["0", "0–0.25", "0.25–0.5", "0.5–1", "1+"],
-                    )
-                    bucket_counts = var_df.groupby("bucket", observed=True).size().reset_index(name="count")
-                    dist_chart = (
-                        alt.Chart(bucket_counts)
+                    st.metric("% zero variance", f"{m1['pct_items_zero_variance']:.1f}%")
+                    st.caption(f"{m1['zero_var_count']} / {m1['n_items']} items")
+                with col3:
+                    st.metric("Exact agreement", f"{m2['mean_agreement_rate']:.1%}")
+                    st.caption("Mean pairwise score match rate")
+    
+                # Overall reliability: stable vs unstable
+                st.subheader("Overall reliability")
+                st.caption(
+                    "Non-zero variance = judge instability (same response, different scores across repeats)."
+                )
+                var_data = [{"item_id": i, "variance": variance(s)} for i, s in by_item.items()]
+                if var_data:
+                    stable = sum(1 for v in var_data if v["variance"] == 0)
+                    unstable = len(var_data) - stable
+                    summary_df = pd.DataFrame([
+                        {"status": "Stable (0 variance)", "items": stable},
+                        {"status": "Unstable (>0 variance)", "items": unstable},
+                    ])
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        fig = px.bar(
+                            summary_df,
+                            x="items",
+                            y="status",
+                            orientation="h",
+                            color="status",
+                            color_discrete_map={
+                                "Stable (0 variance)": "#808080",
+                                "Unstable (>0 variance)": "#808080",
+                            },
+                            pattern_shape="status",
+                            pattern_shape_map={
+                                "Stable (0 variance)": "",
+                                "Unstable (>0 variance)": "/",
+                            },
+                        )
+                        fig.update_layout(
+                            xaxis_title="Number of items",
+                            yaxis_title="",
+                            height=280,
+                            showlegend=False,
+                            margin=dict(t=20, b=40),
+                        )
+                        fig.update_traces(marker_pattern_fillmode="overlay")
+                        st.plotly_chart(fig, use_container_width=True)
+                    with col2:
+                        # Variance distribution: how many items fall in each variance bucket
+                        var_df = pd.DataFrame(var_data)
+                        var_df["bucket"] = pd.cut(
+                            var_df["variance"],
+                            bins=[-0.1, 0, 0.25, 0.5, 1.0, 10],
+                            labels=["0", "0–0.25", "0.25–0.5", "0.5–1", "1+"],
+                        )
+                        bucket_counts = var_df.groupby("bucket", observed=True).size().reset_index(name="count")
+                        dist_chart = (
+                            alt.Chart(bucket_counts)
+                            .mark_bar(color="#808080")
+                            .encode(
+                                x=alt.X("bucket:N", title="Variance range"),
+                                y=alt.Y("count:Q", title="Items"),
+                            )
+                            .properties(height=280)
+                        )
+                        st.altair_chart(dist_chart, use_container_width=True)
+    
+                # Score distribution
+                st.subheader("Score distribution")
+                if counts:
+                    hist_df = pd.DataFrame(
+                        {"score": list(counts.keys()), "count": list(counts.values())}
+                    ).sort_values("score")
+                    hist_df["score"] = hist_df["score"].astype(str)
+                    score_chart = (
+                        alt.Chart(hist_df)
                         .mark_bar(color="#808080")
                         .encode(
-                            x=alt.X("bucket:N", title="Variance range"),
-                            y=alt.Y("count:Q", title="Items"),
+                            x=alt.X(
+                                "score:N",
+                                title="Score",
+                                axis=alt.Axis(labelAngle=-90),
+                            ),
+                            y=alt.Y("count:Q", title="Count"),
                         )
                         .properties(height=280)
                     )
-                    st.altair_chart(dist_chart, use_container_width=True)
+                    st.altair_chart(score_chart, use_container_width=True)
+                else:
+                    st.info("No scores to display.")
+    
+                with st.expander("Raw judgments", expanded=True):
+                    st.dataframe(df, use_container_width=True)
 
-            # Score distribution
-            st.subheader("Score distribution")
-            if counts:
-                hist_df = pd.DataFrame(
-                    {"score": list(counts.keys()), "count": list(counts.values())}
-                ).sort_values("score")
-                hist_df["score"] = hist_df["score"].astype(str)
-                score_chart = (
-                    alt.Chart(hist_df)
-                    .mark_bar(color="#808080")
-                    .encode(
-                        x=alt.X(
-                            "score:N",
-                            title="Score",
-                            axis=alt.Axis(labelAngle=-90),
-                        ),
-                        y=alt.Y("count:Q", title="Count"),
-                    )
-                    .properties(height=280)
-                )
-                st.altair_chart(score_chart, use_container_width=True)
             else:
-                st.info("No scores to display.")
-
-            with st.expander("Raw judgments", expanded=True):
-                st.dataframe(df, use_container_width=True)
-
-        else:
-            st.info("File is empty.")
+                st.info("File is empty.")
 
 
 # ==================== TAB 4: Compare Judges ==============
 with tab_compare:
     st.header("Compare Judges")
     st.caption(
-        "Select multiple result files to compare reliability metrics and score distributions across judges."
+        "Compare judges **within one condition and dataset** when possible (use filters). "
+        "Mixing conditions is allowed but metrics then blend different experimental setups."
     )
-    jsonl_files = list(RESULTS_DIR.glob("*.jsonl")) if RESULTS_DIR.exists() else []
-    if not jsonl_files:
+    summaries_cmp = _all_result_summaries()
+    if not summaries_cmp:
         st.info("No result files. Run experiments with different judges first.")
     else:
-        selected = st.multiselect(
-            "Result files to compare (select 2 or more)",
-            [f.name for f in sorted(jsonl_files, key=lambda p: p.name)],
-            default=[],
-            key="compare_files",
+        cmp_cond_vals = sorted({s["condition"] for s in summaries_cmp}, key=str)
+        cond_filter_cmp = st.selectbox(
+            "Condition",
+            ["(all)"] + cmp_cond_vals,
+            key="compare_filter_condition",
         )
+        dset_cmp_candidates = sorted(
+            {
+                s["dataset_id"]
+                for s in summaries_cmp
+                if cond_filter_cmp == "(all)" or s["condition"] == cond_filter_cmp
+            },
+            key=str,
+        )
+        dset_filter_cmp = st.selectbox(
+            "Dataset",
+            ["(all)"] + dset_cmp_candidates,
+            key="compare_filter_dataset",
+        )
+
+        def _cmp_pick(s):
+            if cond_filter_cmp != "(all)" and s["condition"] != cond_filter_cmp:
+                return False
+            if dset_filter_cmp != "(all)" and s["dataset_id"] != dset_filter_cmp:
+                return False
+            return True
+
+        filtered_cmp = [s for s in summaries_cmp if _cmp_pick(s)]
+        cmp_labels = [
+            f"{s['name']}  ·  {s['condition']}  ·  {s['dataset_id']}  ·  {s['judge_model']}"
+            for s in filtered_cmp
+        ]
+        _cmp_label_to_name = {cmp_labels[i]: filtered_cmp[i]["name"] for i in range(len(filtered_cmp))}
+        pick_cmp = st.multiselect(
+            "Result files to compare (select 2 or more)",
+            cmp_labels,
+            default=[],
+            key="compare_files_pick",
+        )
+        selected = [_cmp_label_to_name[L] for L in pick_cmp]
         if len(selected) < 2:
             st.info("Select at least 2 files to compare.")
         else:
@@ -373,11 +614,14 @@ with tab_compare:
             skipped = []
             for fname in selected:
                 path = RESULTS_DIR / fname
+                summ = _summarize_result_file(path)
                 rows = load_jsonl(path)
                 if not rows:
                     # Extract judge name from filename (mtbench_judge-XYZ_K...)
                     judge = fname.replace("mtbench_judge-", "").split("_K")[0] if "mtbench_judge-" in fname else fname
                     compare_data.append({
+                        "Condition": summ["condition"],
+                        "Dataset": summ["dataset_id"],
                         "Judge": judge,
                         "File": fname,
                         "Items": 0,
@@ -394,6 +638,8 @@ with tab_compare:
                 m2 = metric2_exact_agreement(by_item)
                 mean_score = sum(s for scores in by_item.values() for s in scores) / sum(len(s) for s in by_item.values()) if by_item else 0
                 compare_data.append({
+                    "Condition": summ["condition"],
+                    "Dataset": summ["dataset_id"],
                     "Judge": judge,
                     "File": fname,
                     "Items": m1["n_items"],
@@ -510,10 +756,11 @@ with tab_compare:
                             customdata=spread_df[["min_score", "max_score", "judge_scores"]].values,
                         )
                         spread_fig.add_hline(y=2, line_color="#bbb", line_width=1)
+                        _ymax = max(float(spread_df["spread"].max()), 5.0) * 1.08
                         spread_fig.update_layout(
                             xaxis_title="Item",
                             yaxis_title="Spread",
-                            yaxis=dict(range=[0, 9]),
+                            yaxis=dict(range=[0, _ymax]),
                             height=400,
                             showlegend=False,
                             xaxis={"categoryorder": "array", "categoryarray": spread_df["item_id"].tolist()},
@@ -529,20 +776,15 @@ with tab_compare:
 # ==================== TAB 2: Run Experiment ==============
 with tab_run:
     st.header("Run Experiment")
+    st.caption(
+        "Each run writes `condition_name`, `dataset_id`, and score range on every JSONL row, and the filename includes "
+        "`_cond-gen_`, `_cond-custom_`, or `_cond-metric_`. Use **View Results** / **Compare Judges** filters to view "
+        "generic vs per-item-custom vs metric runs separately."
+    )
 
-    judge_options = [
-        "gpt-4o-mini",
-        "gpt-4o",
-        "gpt-4",
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250514",
-        "claude-haiku-4-5-20251001",
-        "claude-sonnet-4-6",
-        "Custom...",
-    ]
     judge_choice = st.selectbox(
         "Judge model",
-        judge_options,
+        JUDGE_MODEL_PRESETS,
         index=0,
         key="run_judge",
         help="gpt-* → OpenAI; claude-* → Anthropic. Set OPENAI_API_KEY or ANTHROPIC_API_KEY in .env.",
@@ -570,6 +812,27 @@ with tab_run:
         key="run_temp",
         help="Default: 0 for reproducibility. Higher values increase randomness.",
     )
+    condition_labels = {
+        "Generic overall": "generic_overall",
+        "Per-item custom": "per_item_custom",
+        "Metric rubric": "metric_rubric",
+    }
+    condition_display = st.selectbox(
+        "Condition",
+        list(condition_labels.keys()),
+        index=0,
+        key="run_condition",
+        help="Logged as condition_name on each row. Generic ignores judge_instructions; custom uses them; metric rubric for B2 (multi-metric loop comes later).",
+    )
+    condition_name = condition_labels[condition_display]
+    metric_name_run = None
+    if condition_name == "metric_rubric":
+        metric_name_run = st.text_input(
+            "Metric name (optional until B2)",
+            value="",
+            key="run_metric_name",
+            help="e.g. accuracy — stored on each row when set. Leave empty for null.",
+        ).strip() or None
     dataset_choice = st.selectbox(
         "Dataset",
         ["Subset (5 items)", "Full (30 items)"],
@@ -591,8 +854,19 @@ with tab_run:
                         repeats=k_choice,
                         input_path=str(input_path),
                         temperature=float(temp_choice),
+                        condition_name=condition_name,
+                        metric_name=metric_name_run,
+                        dataset_id=input_path.stem,
+                    )
+                    _slug = CONDITION_FILENAME_SLUG.get(
+                        condition_name,
+                        condition_name.replace("_", "")[:12],
                     )
                     st.success(f"Done. Output: {out_path}")
+                    st.info(
+                        f"Tagged **{condition_name}** · dataset **{input_path.stem}** · look for `_cond-{_slug}_` in the "
+                        "filename. On **View Results** / **Compare Judges**, set Condition (and Dataset) filters to this run."
+                    )
                 except Exception as e:
                     st.error(str(e))
 
