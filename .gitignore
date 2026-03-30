@@ -17,5 +17,7 @@ __pycache__/
 .venv/
 venv/
 
+docs/*plan*
+
 # OS
 .DS_Store

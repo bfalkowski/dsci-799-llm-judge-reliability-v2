@@ -554,7 +554,22 @@ with tab_run:
             key="run_judge_custom",
             help="e.g. gpt-4o-mini (OpenAI) or claude-sonnet-4-20250514 (Anthropic)",
         )
-    k_choice = st.selectbox("Repeats per item (K)", [2, 3, 5, 10], index=2, key="run_k")
+    k_choice = st.selectbox(
+        "Repeats per item (K)",
+        [2, 3, 5, 10],
+        index=2,
+        key="run_k",
+        help="Default paper setting: K=5.",
+    )
+    temp_choice = st.number_input(
+        "Temperature",
+        min_value=0.0,
+        max_value=2.0,
+        value=0.0,
+        step=0.1,
+        key="run_temp",
+        help="Default: 0 for reproducibility. Higher values increase randomness.",
+    )
     dataset_choice = st.selectbox(
         "Dataset",
         ["Subset (5 items)", "Full (30 items)"],
@@ -571,7 +586,12 @@ with tab_run:
                 try:
                     from run_repeated_judging import run_experiment
 
-                    out_path = run_experiment(judge_model=judge_choice, repeats=k_choice, input_path=str(input_path))
+                    out_path = run_experiment(
+                        judge_model=judge_choice,
+                        repeats=k_choice,
+                        input_path=str(input_path),
+                        temperature=float(temp_choice),
+                    )
                     st.success(f"Done. Output: {out_path}")
                 except Exception as e:
                     st.error(str(e))

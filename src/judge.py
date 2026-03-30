@@ -7,6 +7,7 @@ Raises RuntimeError if the selected provider's API key is not set.
 import json
 import os
 import sys
+from typing import Optional
 
 JUDGE_TEMPERATURE = 0.0
 
@@ -27,18 +28,24 @@ def is_claude_model(model_id):
     return model_id and str(model_id).strip().lower().startswith("claude")
 
 
-def call_judge(prompt: str, model: str, system_content: str = "You are an evaluator. Output JSON only."):
+def call_judge(
+    prompt: str,
+    model: str,
+    system_content: str = "You are an evaluator. Output JSON only.",
+    temperature: Optional[float] = None,
+):
     """
     Call judge LLM. Routes to OpenAI or Anthropic based on model id.
     Returns (raw_content_str, input_tokens, output_tokens).
     Raises RuntimeError if API key not set or on failure.
     """
+    t = JUDGE_TEMPERATURE if temperature is None else temperature
     if is_claude_model(model):
-        return _call_anthropic(prompt, model, system_content)
-    return _call_openai(prompt, model, system_content)
+        return _call_anthropic(prompt, model, system_content, temperature=t)
+    return _call_openai(prompt, model, system_content, temperature=t)
 
 
-def _call_openai(prompt: str, model: str, system_content: str):
+def _call_openai(prompt: str, model: str, system_content: str, temperature: float):
     """Call OpenAI judge. Requires OPENAI_API_KEY."""
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key or not api_key.strip():
@@ -58,7 +65,7 @@ def _call_openai(prompt: str, model: str, system_content: str):
             {"role": "system", "content": system_content},
             {"role": "user", "content": prompt},
         ],
-        temperature=JUDGE_TEMPERATURE,
+        temperature=temperature,
         max_tokens=500,
         response_format={
             "type": "json_schema",
@@ -111,7 +118,7 @@ def extract_json_from_text(text: str):
     return None
 
 
-def _call_anthropic(prompt: str, model: str, system_content: str):
+def _call_anthropic(prompt: str, model: str, system_content: str, temperature: float):
     """Call Anthropic Claude judge. Requires ANTHROPIC_API_KEY."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key or not api_key.strip():
@@ -133,7 +140,7 @@ def _call_anthropic(prompt: str, model: str, system_content: str):
         "max_tokens": 500,
         "system": f"{system_content}\n\nRespond with a JSON object: {{\"score\": <1-10>, \"justification\": \"<short explanation>\"}}",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": JUDGE_TEMPERATURE,
+        "temperature": temperature,
         "thinking": {"type": "disabled"},
     }
 

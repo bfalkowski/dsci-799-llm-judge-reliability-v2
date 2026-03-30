@@ -36,15 +36,21 @@ def load_dataset(path: Path):
         return json.load(f)
 
 
-def run_experiment(judge_model=None, repeats=None, input_path=None, max_items=None):
+def run_experiment(judge_model=None, repeats=None, input_path=None, max_items=None, temperature=None):
     """
     Run repeated judging. Accepts optional overrides; otherwise uses env/defaults.
     max_items: limit to first N items (for quick tests).
+    temperature: sampling temperature; default from env TEMPERATURE or TEMPERATURE constant (0.0).
     Returns path to output file on success.
     """
     load_dotenv(REPO_ROOT / ".env")
     model = judge_model or os.environ.get("JUDGE_MODEL", JUDGE_MODEL)
     k = repeats if repeats is not None else int(os.environ.get("REPEATS", REPEATS))
+    temp = (
+        float(temperature)
+        if temperature is not None
+        else float(os.environ.get("TEMPERATURE", str(TEMPERATURE)))
+    )
     data_path = Path(input_path) if input_path else INPUT_PATH
 
     if is_claude_model(model):
@@ -62,7 +68,8 @@ def run_experiment(judge_model=None, repeats=None, input_path=None, max_items=No
 
     execution_id = str(uuid.uuid4())
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-    output_path = REPO_ROOT / "results" / f"mtbench_judge-{model.replace('/', '_')}_K{k}_t{TEMPERATURE}_{timestamp}.jsonl"
+    t_tag = str(temp).replace(".", "p") if "." in str(temp) else str(temp)
+    output_path = REPO_ROOT / "results" / f"mtbench_judge-{model.replace('/', '_')}_K{k}_t{t_tag}_{timestamp}.jsonl"
     print(f"Execution ID: {execution_id}")
 
     with tracer.start_as_current_span("judge_execution") as exec_span:
@@ -95,12 +102,15 @@ def run_experiment(judge_model=None, repeats=None, input_path=None, max_items=No
                         span.set_attribute("item_id", str(item_id))
                         span.set_attribute("repeat_idx", idx)
                         span.set_attribute("gen_ai.request.model", model)
-                        span.set_attribute("gen_ai.request.temperature", TEMPERATURE)
+                        span.set_attribute("gen_ai.request.temperature", temp)
 
                         start_time = time.time()
                         logger.info(f"Judging item {item_id} | Repeat {idx}")
                         raw_output, input_tokens, output_tokens = call_judge(
-                            prompt, model, system_content="You are an evaluator. Output JSON only."
+                            prompt,
+                            model,
+                            system_content="You are an evaluator. Output JSON only.",
+                            temperature=temp,
                         )
                         latency = int((time.time() - start_time) * 1000)
 

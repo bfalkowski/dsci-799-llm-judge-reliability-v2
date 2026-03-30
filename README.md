@@ -60,7 +60,7 @@ Structured output (JSON: score 1–10, justification) is used for both. OpenTele
 
 ## Repository Structure
 
-- `docs/` – proposal drafts and literature review notes
+- `docs/` – proposal, literature, **`docs/final_plan.example.md`** (plan template; working copy **`docs/final_plan.md`** is gitignored)
 - `experiments/` – experiment definitions and run configurations
 - `data/` – MT-Bench subset and dataset metadata
 - `results/` – judge output JSONL files (gitignored)
