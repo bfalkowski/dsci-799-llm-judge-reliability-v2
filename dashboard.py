@@ -22,6 +22,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 from constants import JUDGE_MODEL
 from judge import build_rubric_generator_user_prompt, call_text_model, is_claude_model
+from metric_rubric import METRIC_GLOSS_DEFAULTS
 from run_repeated_judging import CONDITION_FILENAME_SLUG
 from compute_metrics import (
     _group_by_item,
@@ -85,6 +86,13 @@ def _all_result_summaries() -> list:
         return []
     out = [_summarize_result_file(p) for p in sorted(RESULTS_DIR.glob("*.jsonl"), key=lambda p: p.name)]
     return out
+
+
+def _rows_for_single_metric(rows: list, metric_name: Optional[str]):
+    """Condition B: restrict rows before grouping; avoids relying on compute_metrics keyword compat."""
+    if metric_name is None:
+        return rows
+    return [r for r in rows if str(r.get("metric_name")) == str(metric_name)]
 
 
 def _normalize_judge_dataset(data):
@@ -446,23 +454,43 @@ with tab_view:
             rows = load_jsonl(path)
             if rows:
                 df = pd.DataFrame(rows)
-                by_item = _group_by_item(rows)
+                metric_opts = sorted(
+                    {str(r["metric_name"]) for r in rows if r.get("metric_name")},
+                    key=str,
+                )
+                view_metric_filter = None
+                if len(metric_opts) == 1:
+                    view_metric_filter = metric_opts[0]
+                    st.caption(f"Condition **B** — reliability for metric **{view_metric_filter}** only.")
+                elif len(metric_opts) > 1:
+                    view_metric_filter = st.selectbox(
+                        "Metric (this file)",
+                        metric_opts,
+                        key="view_metric_pick",
+                        help="One JSONL row per (item, repeat, metric). Charts use the selected metric.",
+                    )
+
+                rows_m = _rows_for_single_metric(rows, view_metric_filter)
+                by_item = _group_by_item(rows_m)
                 m1 = metric1_per_item_variance(by_item)
                 m2 = metric2_exact_agreement(by_item)
-                counts = metric3_score_histogram(rows)
+                counts = metric3_score_histogram(rows_m)
     
                 # Metrics section
                 st.subheader("Reliability metrics")
-                col1, col2, col3 = st.columns(3)
+                col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     st.metric("Mean variance", f"{m1['mean_variance']:.4f}")
                     st.caption("Per-item score variance across K runs")
                 with col2:
+                    st.metric("Mean within-item SD", f"{m1['mean_within_item_std']:.3f}")
+                    st.caption("Average √(per-item variance); same units as score (0–100). 0 = perfectly stable repeats.")
+                with col3:
                     st.metric("% zero variance", f"{m1['pct_items_zero_variance']:.1f}%")
                     st.caption(f"{m1['zero_var_count']} / {m1['n_items']} items")
-                with col3:
-                    st.metric("Exact agreement", f"{m2['mean_agreement_rate']:.1%}")
-                    st.caption("Mean pairwise score match rate")
+                with col4:
+                    st.metric("Repeat agreement (exact)", f"{m2['mean_agreement_rate']:.1%}")
+                    st.caption("Per item: fraction of repeat pairs with identical integer score; then mean over items—not the same as mean score.")
     
                 # Overall reliability: stable vs unstable
                 st.subheader("Overall reliability")
@@ -559,8 +587,8 @@ with tab_view:
 with tab_compare:
     st.header("Compare Judges")
     st.caption(
-        "Compare judges **within one condition and dataset** when possible (use filters). "
-        "Mixing conditions is allowed but metrics then blend different experimental setups."
+        "Pick **condition**, then **dataset** — only result files that match both are available to compare. "
+        "Run the same condition and dataset across judges for a valid comparison."
     )
     summaries_cmp = _all_result_summaries()
     if not summaries_cmp:
@@ -568,39 +596,40 @@ with tab_compare:
     else:
         cmp_cond_vals = sorted({s["condition"] for s in summaries_cmp}, key=str)
         cond_filter_cmp = st.selectbox(
-            "Condition",
-            ["(all)"] + cmp_cond_vals,
+            "1. Condition",
+            cmp_cond_vals,
+            index=0,
             key="compare_filter_condition",
+            help="Required. Files from other conditions are hidden so you cannot mix A / B / C by accident.",
         )
         dset_cmp_candidates = sorted(
-            {
-                s["dataset_id"]
-                for s in summaries_cmp
-                if cond_filter_cmp == "(all)" or s["condition"] == cond_filter_cmp
-            },
+            {s["dataset_id"] for s in summaries_cmp if s["condition"] == cond_filter_cmp},
             key=str,
         )
-        dset_filter_cmp = st.selectbox(
-            "Dataset",
-            ["(all)"] + dset_cmp_candidates,
-            key="compare_filter_dataset",
-        )
-
-        def _cmp_pick(s):
-            if cond_filter_cmp != "(all)" and s["condition"] != cond_filter_cmp:
-                return False
-            if dset_filter_cmp != "(all)" and s["dataset_id"] != dset_filter_cmp:
-                return False
-            return True
-
-        filtered_cmp = [s for s in summaries_cmp if _cmp_pick(s)]
+        if not dset_cmp_candidates:
+            st.warning("No runs found for this condition.")
+            filtered_cmp = []
+            dset_filter_cmp = None
+        else:
+            dset_filter_cmp = st.selectbox(
+                "2. Dataset",
+                dset_cmp_candidates,
+                index=0,
+                key="compare_filter_dataset",
+                help="Required. Subset vs full bench must match across compared files.",
+            )
+            filtered_cmp = [
+                s
+                for s in summaries_cmp
+                if s["condition"] == cond_filter_cmp and s["dataset_id"] == dset_filter_cmp
+            ]
         cmp_labels = [
             f"{s['name']}  ·  {s['condition']}  ·  {s['dataset_id']}  ·  {s['judge_model']}"
             for s in filtered_cmp
         ]
         _cmp_label_to_name = {cmp_labels[i]: filtered_cmp[i]["name"] for i in range(len(filtered_cmp))}
         pick_cmp = st.multiselect(
-            "Result files to compare (select 2 or more)",
+            "3. Result files (select 2+ judges)",
             cmp_labels,
             default=[],
             key="compare_files_pick",
@@ -609,168 +638,204 @@ with tab_compare:
         if len(selected) < 2:
             st.info("Select at least 2 files to compare.")
         else:
-            # Load each file and compute metrics
-            compare_data = []
-            skipped = []
-            for fname in selected:
-                path = RESULTS_DIR / fname
-                summ = _summarize_result_file(path)
-                rows = load_jsonl(path)
-                if not rows:
-                    # Extract judge name from filename (mtbench_judge-XYZ_K...)
-                    judge = fname.replace("mtbench_judge-", "").split("_K")[0] if "mtbench_judge-" in fname else fname
+            metric_sets = [
+                {str(r["metric_name"]) for r in load_jsonl(RESULTS_DIR / fn) if r.get("metric_name")}
+                for fn in selected
+            ]
+            compare_metric_choice = None
+            skip_compare = False
+            each_file_has_metrics = all(len(s) > 0 for s in metric_sets)
+            some_have_metrics = any(len(s) > 0 for s in metric_sets)
+            if each_file_has_metrics:
+                _common = set.intersection(*metric_sets)
+                if not _common:
+                    st.error(
+                        "Each selected file has condition B rows, but no metric_name is shared across all of them."
+                    )
+                    skip_compare = True
+                else:
+                    compare_metric_choice = st.selectbox(
+                        "Metric (condition B)",
+                        sorted(_common),
+                        key="compare_b_metric",
+                        help="Restrict analysis to this metric.",
+                    )
+            elif some_have_metrics:
+                st.warning(
+                    "Some files have metric_name rows and some do not; prefer comparing all-B or all non-B runs."
+                )
+
+            if skip_compare:
+                st.info("Pick files that share the same metrics to compare condition B results.")
+            else:
+                # Load each file and compute metrics
+                compare_data = []
+                skipped = []
+                for fname in selected:
+                    path = RESULTS_DIR / fname
+                    summ = _summarize_result_file(path)
+                    rows = load_jsonl(path)
+                    if compare_metric_choice is not None:
+                        rows = [r for r in rows if str(r.get("metric_name")) == str(compare_metric_choice)]
+                    if not rows:
+                        # Extract judge name from filename (mtbench_judge-XYZ_K...)
+                        judge = fname.replace("mtbench_judge-", "").split("_K")[0] if "mtbench_judge-" in fname else fname
+                        compare_data.append({
+                            "Condition": summ["condition"],
+                            "Dataset": summ["dataset_id"],
+                            "Judge": judge,
+                            "File": fname,
+                            "Items": 0,
+                            "Mean score": "—",
+                            "Mean variance": "—",
+                            "Mean within-item SD": "—",
+                            "% zero variance": "—",
+                            "Repeat agreement (exact)": "—",
+                        })
+                        skipped.append(fname)
+                        continue
+                    judge = rows[0].get("judge_model", fname)
+                    by_item = _group_by_item(rows)
+                    m1 = metric1_per_item_variance(by_item)
+                    m2 = metric2_exact_agreement(by_item)
+                    mean_score = sum(s for scores in by_item.values() for s in scores) / sum(len(s) for s in by_item.values()) if by_item else 0
                     compare_data.append({
                         "Condition": summ["condition"],
                         "Dataset": summ["dataset_id"],
                         "Judge": judge,
                         "File": fname,
-                        "Items": 0,
-                        "Mean score": "—",
-                        "Mean variance": "—",
-                        "% zero variance": "—",
-                        "Exact agreement": "—",
+                        "Items": m1["n_items"],
+                        "Mean score": round(mean_score, 2),
+                        "Mean variance": round(m1["mean_variance"], 4),
+                        "Mean within-item SD": round(m1["mean_within_item_std"], 4),
+                        "% zero variance": round(m1["pct_items_zero_variance"], 1),
+                        "Repeat agreement (exact)": f"{m2['mean_agreement_rate']:.1%}",
                     })
-                    skipped.append(fname)
-                    continue
-                judge = rows[0].get("judge_model", fname)
-                by_item = _group_by_item(rows)
-                m1 = metric1_per_item_variance(by_item)
-                m2 = metric2_exact_agreement(by_item)
-                mean_score = sum(s for scores in by_item.values() for s in scores) / sum(len(s) for s in by_item.values()) if by_item else 0
-                compare_data.append({
-                    "Condition": summ["condition"],
-                    "Dataset": summ["dataset_id"],
-                    "Judge": judge,
-                    "File": fname,
-                    "Items": m1["n_items"],
-                    "Mean score": round(mean_score, 2),
-                    "Mean variance": round(m1["mean_variance"], 4),
-                    "% zero variance": round(m1["pct_items_zero_variance"], 1),
-                    "Exact agreement": f"{m2['mean_agreement_rate']:.1%}",
-                })
 
-            if skipped:
-                st.warning(f"Skipped (empty): {', '.join(skipped)}")
-            if compare_data:
-                st.subheader("Per-judge metrics")
-                st.dataframe(pd.DataFrame(compare_data), use_container_width=True)
+                if skipped:
+                    st.warning(f"Skipped (empty): {', '.join(skipped)}")
+                if compare_data:
+                    st.subheader("Per-judge metrics")
+                    st.dataframe(pd.DataFrame(compare_data), use_container_width=True)
+                    st.caption(
+                        "**Mean score** is the average of all valid **integer** judgments (items × repeats), so decimals are normal. "
+                        "**Mean within-item SD** is the average of √(per-item variance) — typical spread of repeat scores in **points** on the 0–100 scale. "
+                        "**Repeat agreement (exact)** is separate: fraction of repeat pairs that match exactly, averaged over items."
+                    )
 
-                # Reliability chart: % zero variance (higher = more reliable)
-                rel_data = [
-                    {"judge": r["Judge"], "pct_zero_variance": r["% zero variance"]}
-                    for r in compare_data
-                    if isinstance(r["% zero variance"], (int, float))
-                ]
-                if rel_data:
-                    st.subheader("Reliability: % items with zero variance")
-                    st.caption("Higher = more stable. Same item, same response → identical scores across repeats.")
-                    rel_df = pd.DataFrame(rel_data)
-                    fig = px.bar(
-                        rel_df,
-                        x="pct_zero_variance",
-                        y="judge",
-                        orientation="h",
-                    )
-                    fig.update_traces(marker_color="#808080")
-                    fig.update_layout(
-                        xaxis_title="% zero variance",
-                        yaxis_title="",
-                        xaxis=dict(range=[0, 105]),
-                        height=max(200, 60 * len(rel_data)),
-                        showlegend=False,
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("No reliability data to chart (select files with valid judgments).")
-
-                # Score spread per item across judges
-                st.subheader("Score spread per item across judges")
-                st.caption(
-                    "Spread = max(score across judges) − min(score across judges). Higher = more disagreement. "
-                    "All compared files must share the same dataset (same item set)."
-                )
-                # Build item sets and mean scores per judge; validate same dataset across files
-                file_item_sets = {}
-                spread_by_item: dict = {}
-                for fname in selected:
-                    if fname in skipped:
-                        continue
-                    path = RESULTS_DIR / fname
-                    rows = load_jsonl(path)
-                    judge = rows[0].get("judge_model", fname.replace("mtbench_judge-", "").split("_K")[0]) if rows else fname
-                    by_item = _group_by_item(rows)
-                    item_ids = frozenset(by_item.keys())
-                    file_item_sets[fname] = (len(item_ids), item_ids)
-                    for item_id, scores in by_item.items():
-                        spread_by_item.setdefault(item_id, {})[judge] = sum(scores) / len(scores)
-                # Validate: same number of items and same item_ids across all files
-                spread_valid = len(file_item_sets) >= 2
-                if spread_valid:
-                    ref_count, ref_items = next(iter(file_item_sets.values()))
-                    for fname, (n, items) in file_item_sets.items():
-                        if n != ref_count or items != ref_items:
-                            spread_valid = False
-                            break
-                if not spread_valid or len(file_item_sets) < 2:
-                    st.warning(
-                        "All compared files must have the same number of items and represent the same dataset (frozen subset). "
-                        "Cannot compute spread across judges."
-                    )
-                else:
-                    # Compute spread per item: max - min across judges
-                    spread_rows = []
-                    for item_id, judge_scores in spread_by_item.items():
-                        if len(judge_scores) >= 2:
-                            all_means = list(judge_scores.values())
-                            mn, mx = min(all_means), max(all_means)
-                            spread = mx - mn
-                            spread_rows.append({
-                                "item_id": item_id,
-                                "spread": spread,
-                                "min_score": mn,
-                                "max_score": mx,
-                                "judge_scores": ", ".join(f"{j}: {s:.1f}" for j, s in sorted(judge_scores.items())),
-                            })
-                    if spread_rows:
-                        spread_df = pd.DataFrame(spread_rows).sort_values("spread", ascending=False)
-                        # Summary metrics
-                        mean_spread = spread_df["spread"].mean()
-                        pct_spread_ge2 = 100 * (spread_df["spread"] >= 2).sum() / len(spread_df)
-                        max_spread = spread_df["spread"].max()
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            st.metric("Mean spread", f"{mean_spread:.2f}")
-                        with col2:
-                            st.metric("% items with spread ≥ 2", f"{pct_spread_ge2:.1f}%")
-                        with col3:
-                            st.metric("Max spread", f"{max_spread:.0f}")
-                        # Bar chart: one bar per item, sorted by spread desc
-                        spread_fig = px.bar(
-                            spread_df,
-                            x="item_id",
-                            y="spread",
+                    # Reliability chart: % zero variance (higher = more reliable)
+                    rel_data = [
+                        {"judge": r["Judge"], "pct_zero_variance": r["% zero variance"]}
+                        for r in compare_data
+                        if isinstance(r["% zero variance"], (int, float))
+                    ]
+                    if rel_data:
+                        st.subheader("Reliability: % items with zero variance")
+                        st.caption("Higher = more stable. Same item, same response → identical scores across repeats.")
+                        rel_df = pd.DataFrame(rel_data)
+                        fig = px.bar(
+                            rel_df,
+                            x="pct_zero_variance",
+                            y="judge",
+                            orientation="h",
                         )
-                        spread_fig.update_traces(
-                            marker_color="#808080",
-                            hovertemplate="<b>Item %{x}</b><br>Spread: %{y}<br>Min score: %{customdata[0]:.1f}<br>Max score: %{customdata[1]:.1f}<br>%{customdata[2]}<extra></extra>",
-                            customdata=spread_df[["min_score", "max_score", "judge_scores"]].values,
-                        )
-                        spread_fig.add_hline(y=2, line_color="#bbb", line_width=1)
-                        _ymax = max(float(spread_df["spread"].max()), 5.0) * 1.08
-                        spread_fig.update_layout(
-                            xaxis_title="Item",
-                            yaxis_title="Spread",
-                            yaxis=dict(range=[0, _ymax]),
-                            height=400,
+                        fig.update_traces(marker_color="#808080")
+                        fig.update_layout(
+                            xaxis_title="% zero variance",
+                            yaxis_title="",
+                            xaxis=dict(range=[0, 105]),
+                            height=max(200, 60 * len(rel_data)),
                             showlegend=False,
-                            xaxis={"categoryorder": "array", "categoryarray": spread_df["item_id"].tolist()},
                         )
-                        st.plotly_chart(spread_fig, use_container_width=True)
+                        st.plotly_chart(fig, use_container_width=True)
                     else:
-                        st.info(
-                            "Need items scored by at least 2 judges. "
-                            "Ensure selected files share common item_ids (e.g. same dataset)."
+                        st.info("No reliability data to chart (select files with valid judgments).")
+
+                    # Score spread per item across judges
+                    st.subheader("Score spread per item across judges")
+                    st.caption(
+                        "Spread = max(score across judges) − min(score across judges). Higher = more disagreement. "
+                        "All compared files must share the same dataset (same item set)."
+                    )
+                    file_item_sets = {}
+                    spread_by_item: dict = {}
+                    for fname in selected:
+                        if fname in skipped:
+                            continue
+                        path = RESULTS_DIR / fname
+                        rows = load_jsonl(path)
+                        if compare_metric_choice is not None:
+                            rows = [r for r in rows if str(r.get("metric_name")) == str(compare_metric_choice)]
+                        judge = rows[0].get("judge_model", fname.replace("mtbench_judge-", "").split("_K")[0]) if rows else fname
+                        by_item = _group_by_item(rows)
+                        item_ids = frozenset(by_item.keys())
+                        file_item_sets[fname] = (len(item_ids), item_ids)
+                        for item_id, scores in by_item.items():
+                            spread_by_item.setdefault(item_id, {})[judge] = sum(scores) / len(scores)
+                    spread_valid = len(file_item_sets) >= 2
+                    if spread_valid:
+                        ref_count, ref_items = next(iter(file_item_sets.values()))
+                        for fname, (n, items) in file_item_sets.items():
+                            if n != ref_count or items != ref_items:
+                                spread_valid = False
+                                break
+                    if not spread_valid or len(file_item_sets) < 2:
+                        st.warning(
+                            "All compared files must have the same number of items and represent the same dataset (frozen subset). "
+                            "Cannot compute spread across judges."
                         )
+                    else:
+                        spread_rows = []
+                        for item_id, judge_scores in spread_by_item.items():
+                            if len(judge_scores) >= 2:
+                                all_means = list(judge_scores.values())
+                                mn, mx = min(all_means), max(all_means)
+                                spread = mx - mn
+                                spread_rows.append({
+                                    "item_id": item_id,
+                                    "spread": spread,
+                                    "min_score": mn,
+                                    "max_score": mx,
+                                    "judge_scores": ", ".join(f"{j}: {s:.1f}" for j, s in sorted(judge_scores.items())),
+                                })
+                        if spread_rows:
+                            spread_df = pd.DataFrame(spread_rows).sort_values("spread", ascending=False)
+                            mean_spread = spread_df["spread"].mean()
+                            pct_spread_ge2 = 100 * (spread_df["spread"] >= 2).sum() / len(spread_df)
+                            max_spread = spread_df["spread"].max()
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Mean spread", f"{mean_spread:.2f}")
+                            with col2:
+                                st.metric("% items with spread ≥ 2", f"{pct_spread_ge2:.1f}%")
+                            with col3:
+                                st.metric("Max spread", f"{max_spread:.0f}")
+                            spread_fig = px.bar(
+                                spread_df,
+                                x="item_id",
+                                y="spread",
+                            )
+                            spread_fig.update_traces(
+                                marker_color="#808080",
+                                hovertemplate="<b>Item %{x}</b><br>Spread: %{y}<br>Min score: %{customdata[0]:.1f}<br>Max score: %{customdata[1]:.1f}<br>%{customdata[2]}<extra></extra>",
+                                customdata=spread_df[["min_score", "max_score", "judge_scores"]].values,
+                            )
+                            spread_fig.add_hline(y=2, line_color="#bbb", line_width=1)
+                            _ymax = max(float(spread_df["spread"].max()), 5.0) * 1.08
+                            spread_fig.update_layout(
+                                xaxis_title="Item",
+                                yaxis_title="Spread",
+                                yaxis=dict(range=[0, _ymax]),
+                                height=400,
+                                showlegend=False,
+                                xaxis={"categoryorder": "array", "categoryarray": spread_df["item_id"].tolist()},
+                            )
+                            st.plotly_chart(spread_fig, use_container_width=True)
+                        else:
+                            st.info(
+                                "Need items scored by at least 2 judges. "
+                                "Ensure selected files share common item_ids (e.g. same dataset)."
+                            )
 
 
 # ==================== TAB 2: Run Experiment ==============
@@ -822,17 +887,20 @@ with tab_run:
         list(condition_labels.keys()),
         index=0,
         key="run_condition",
-        help="Logged as condition_name on each row. Generic ignores judge_instructions; custom uses them; metric rubric for B2 (multi-metric loop comes later).",
+        help="Logged as condition_name on each row. Generic ignores judge_instructions; custom uses them; metric rubric runs one judge call per metric per item per repeat (B2).",
     )
     condition_name = condition_labels[condition_display]
-    metric_name_run = None
+    metrics_pick_run: list = []
     if condition_name == "metric_rubric":
-        metric_name_run = st.text_input(
-            "Metric name (optional until B2)",
-            value="",
-            key="run_metric_name",
-            help="e.g. accuracy — stored on each row when set. Leave empty for null.",
-        ).strip() or None
+        _metric_options = sorted(METRIC_GLOSS_DEFAULTS.keys())
+        _default_metrics = [m for m in ("accuracy", "helpfulness", "relevance") if m in METRIC_GLOSS_DEFAULTS]
+        metrics_pick_run = st.multiselect(
+            "Metrics",
+            options=_metric_options,
+            default=_default_metrics,
+            key="run_metrics_multiselect",
+            help="Select one or more dimensions from metric_rubric.py. One judge call per item × repeat × metric.",
+        )
     dataset_choice = st.selectbox(
         "Dataset",
         ["Subset (5 items)", "Full (30 items)"],
@@ -845,30 +913,38 @@ with tab_run:
         if "Full" in dataset_choice and not input_path.exists():
             st.error("mt_bench_full.json not found. Run: python src/build_mt_bench_full.py")
         else:
-            with st.spinner("Running experiment (calling judge API)..."):
-                try:
-                    from run_repeated_judging import run_experiment
+            metric_names_arg = None
+            block_run = False
+            if condition_name == "metric_rubric":
+                metric_names_arg = list(metrics_pick_run)
+                if not metric_names_arg:
+                    st.error("Condition B requires at least one metric — select one or more in the Metrics list.")
+                    block_run = True
+            if not block_run and (condition_name != "metric_rubric" or metric_names_arg):
+                with st.spinner("Running experiment (calling judge API)..."):
+                    try:
+                        from run_repeated_judging import run_experiment
 
-                    out_path = run_experiment(
-                        judge_model=judge_choice,
-                        repeats=k_choice,
-                        input_path=str(input_path),
-                        temperature=float(temp_choice),
-                        condition_name=condition_name,
-                        metric_name=metric_name_run,
-                        dataset_id=input_path.stem,
-                    )
-                    _slug = CONDITION_FILENAME_SLUG.get(
-                        condition_name,
-                        condition_name.replace("_", "")[:12],
-                    )
-                    st.success(f"Done. Output: {out_path}")
-                    st.info(
-                        f"Tagged **{condition_name}** · dataset **{input_path.stem}** · look for `_cond-{_slug}_` in the "
-                        "filename. On **View Results** / **Compare Judges**, set Condition (and Dataset) filters to this run."
-                    )
-                except Exception as e:
-                    st.error(str(e))
+                        out_path = run_experiment(
+                            judge_model=judge_choice,
+                            repeats=k_choice,
+                            input_path=str(input_path),
+                            temperature=float(temp_choice),
+                            condition_name=condition_name,
+                            metric_names=metric_names_arg,
+                            dataset_id=input_path.stem,
+                        )
+                        _slug = CONDITION_FILENAME_SLUG.get(
+                            condition_name,
+                            condition_name.replace("_", "")[:12],
+                        )
+                        st.success(f"Done. Output: {out_path}")
+                        st.info(
+                            f"Tagged **{condition_name}** · dataset **{input_path.stem}** · look for `_cond-{_slug}_` in the "
+                            "filename. On **View Results** / **Compare Judges**, set Condition (and Dataset) filters to this run."
+                        )
+                    except Exception as e:
+                        st.error(str(e))
 
     st.divider()
     jsonl_files = list(RESULTS_DIR.glob("*.jsonl")) if RESULTS_DIR.exists() else []

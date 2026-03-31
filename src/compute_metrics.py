@@ -5,6 +5,7 @@ from collections import Counter
 from pathlib import Path
 
 import itertools
+from math import sqrt
 
 from typing import Dict, List, Optional
 
@@ -18,10 +19,14 @@ def _get_score(row: dict) -> Optional[int]:
     return int(s) if s is not None else None
 
 
-def _group_by_item(rows: List[dict]) -> Dict[str, List[int]]:
-    """Group valid scores by item_id."""
+def _group_by_item(rows: List[dict], metric_name: Optional[str] = None) -> Dict[str, List[int]]:
+    """Group valid scores by item_id. If metric_name is set, only rows with that metric_name count (condition B)."""
     by_item: Dict[str, List[int]] = {}
     for r in rows:
+        if metric_name is not None:
+            rn = r.get("metric_name")
+            if rn is None or str(rn) != str(metric_name):
+                continue
         score = _get_score(r)
         if score is not None:
             item_id = str(r.get("item_id", ""))
@@ -59,9 +64,12 @@ def metric1_per_item_variance(by_item: Dict[str, List[int]]) -> dict:
     n_items = len(by_item)
     mean_var = sum(variances) / n_items if n_items else 0
     pct_zero = 100 * zero_var_count / n_items if n_items else 0
+    # Average of per-item sample SDs (sqrt of per-item variance); same units as score (0–100).
+    mean_within_item_std = sum(sqrt(v) for v in variances) / n_items if n_items else 0.0
 
     return {
         "mean_variance": mean_var,
+        "mean_within_item_std": mean_within_item_std,
         "pct_items_zero_variance": pct_zero,
         "n_items": n_items,
         "zero_var_count": zero_var_count,
@@ -69,7 +77,8 @@ def metric1_per_item_variance(by_item: Dict[str, List[int]]) -> dict:
 
 
 def metric2_exact_agreement(by_item: Dict[str, List[int]]) -> dict:
-    """Exact agreement: fraction of score pairs that match per item, mean across items."""
+    """Per item: among all unordered pairs of repeat scores, fraction with exact integer equality.
+    Return the mean of those fractions across items (not comparable to mean score, which averages raw scores)."""
     agreement_rates = []
     for scores in by_item.values():
         n = len(scores)
@@ -137,9 +146,17 @@ def per_item_table(rows: List[dict]) -> List[dict]:
     return result
 
 
-def metric3_score_histogram(rows: List[dict]) -> Dict[int, int]:
-    """Score distribution (count per score)."""
-    scores = [s for r in rows if (s := _get_score(r)) is not None]
+def metric3_score_histogram(rows: List[dict], metric_name: Optional[str] = None) -> Dict[int, int]:
+    """Score distribution (count per score). Optionally restrict to one metric_name (condition B)."""
+    scores = []
+    for r in rows:
+        if metric_name is not None:
+            rn = r.get("metric_name")
+            if rn is None or str(rn) != str(metric_name):
+                continue
+        s = _get_score(r)
+        if s is not None:
+            scores.append(s)
     return dict(Counter(scores))
 
 
@@ -267,13 +284,14 @@ def main():
     m1 = metric1_per_item_variance(by_item)
     print("1. PER-ITEM VARIANCE")
     print("   Mean variance across items:    {:.4f}".format(m1["mean_variance"]))
+    print("   Mean within-item SD (score units): {:.4f}".format(m1["mean_within_item_std"]))
     print("   % of items with zero variance: {:.1f}%".format(m1["pct_items_zero_variance"]))
     print(f"   ({m1['zero_var_count']} / {m1['n_items']} items)")
     print()
 
-    # 2. Exact agreement rate
+    # 2. Repeat agreement (exact)
     m2 = metric2_exact_agreement(by_item)
-    print("2. EXACT AGREEMENT RATE")
+    print("2. REPEAT AGREEMENT RATE (exact integer match within item)")
     print("   Mean agreement across items: {:.2%}".format(m2["mean_agreement_rate"]))
     print(f"   ({m2['n_items']} items)")
     print()
