@@ -1,52 +1,48 @@
-## What is this dashboard?
+## Purpose
 
-This dashboard supports **DSCI 799** capstone research on the **reliability of LLM-as-a-Judge evaluation**.
-It lets you run experiments, inspect results, and manage data—all in one place.
+This app supports **LLM-as-a-judge reliability** work for **DSCI 799**: we hold **questions and reference responses** fixed, ask one or more **judge models** to score the same answer **many times**, and quantify whether scores **hold still** (within a judge) and how much judges **disagree** with each other (across models). Raw outputs are **JSONL judgment records** suitable for analysis and reproducibility.
 
----------------------------------
-Stages Completed
----------------------------------
-Stage 1: get dataset from MT-Bench  
-    https://github.com/lm-sys/FastChat/blob/main/fastchat/llm_judge/data/mt_bench/question.jsonl
+---
 
-    https://github.com/lm-sys/FastChat/blob/main/fastchat/llm_judge/data/mt_bench/reference_answer/gpt-4.jsonl
-    
-    Added to data/raw (do not include in git)
+## Experimental design
 
-Stage 2: create subset
-    Format. Generated manually
+We use a **frozen** slice of **MT-Bench**-style items (`mt_bench_subset.json` or `mt_bench_full.json`). Every condition and every judge sees the **same items** for a fair comparison.
 
-        {
-        "item_id": "101",
-        "question": ".."
-        "response": "..."
-        },
+**Three judging conditions** (logged on every row as `condition_name`):
 
-Stage 3: configure judge
+| Condition | Idea |
+|-----------|------|
+| **A — Generic overall** | One holistic 0–100 score from a single prompt. Per-item custom text is **not** injected. |
+| **B — Metric rubric** | Separate scores per **dimension** (e.g. accuracy, helpfulness, relevance). Each dimension is its own judge call per item per repeat. Only metrics defined in `metric_rubric.py` are allowed (no silent fallbacks). |
+| **C — Per-item custom** | For each item, optional `judge_instructions` are prepended to the prompt (manually or via **Generate custom judge instructions** on the dataset tab). |
 
-    Get resposne from OPenAI using key
+Runs are tagged in filenames with `_cond-gen_`, `_cond-metric_`, or `_cond-custom_`, and in rows with `dataset_id`, `score_min` / `score_max`, and (for B) `metric_name`.
 
-    run_repeated_judging.py to evaluate subset
-        format: 
-        {"execution_id": GUID,
-        "item_id": int, 
-        "repeat_idx": int, 
-        "judge_model": str, 
-        "score": int, 
-        "justification": string, 
-        "latency_ms": int, 
-        "created_at": datetime
-        }
+---
 
+## Workflow in this dashboard
 
-Stage 4: run judge on subset 
-    run each judge multiple k times
+1. **Dataset & prompts** — View or edit the frozen JSON; generate or overwrite **per-item instructions** for Condition C if needed.  
+2. **Run experiment** — Choose condition, dataset (subset vs full), judge model, **K** repeats, temperature, and (for B) which **metrics** to score. Expect **items × K** judge calls for A/C, and **items × K × (#metrics)** for B.  
+3. **View results** — Pick **condition** and **dataset** filters, then one result file. For Condition B, choose which **metric** to plot (variance and agreement are computed **within** that metric).  
+4. **Compare judges** — Select **condition** and **dataset** first so only compatible files appear; then choose **two or more** result files. For B, pick a **metric** shared by all files. Tables report **mean score**, **mean variance**, **mean within-item SD** (typical repeat spread in points), **% items with zero variance**, and **repeat agreement (exact)**. Charts summarize stability and **cross-judge spread per item**.  
+5. **Telemetry / Manage** — Optional tracing and housekeeping.
 
-Stage 5: add to dashboard 
-    show results
+---
 
-Next steps:  
-Add telemetry
+## Reliability metrics (short definitions)
 
-derive metrics
+- **Within a judge, same item:** we compare the **K** integer scores (0–100). **Mean variance** / **mean within-item SD** summarize how much repeats **jitter**. **Repeat agreement (exact)** is the average fraction of repeat pairs that match **exactly**—not the same thing as **mean score**, which can be a decimal because it averages many integers **across** items and repeats.  
+- **Across judges:** after fixing condition, dataset, and (if B) metric, **spread** is roughly how far apart the judges’ **per-item means** fall on the scale.
 
+---
+
+## Data sources
+
+MT-Bench question and reference material can be obtained from the **FastChat** MT-Bench assets (e.g. `question.jsonl`, reference answers); processed files live under `data/` with the `mt_bench*.json` naming used by the runner.
+
+---
+
+## Bottom line
+
+The dashboard is the **control room** for running the **7 judge models × 3 conditions × K repeats** grid on a frozen benchmark slice, then inspecting **within-judge stability** and **between-judge disagreement** without mixing conditions or datasets by accident.
