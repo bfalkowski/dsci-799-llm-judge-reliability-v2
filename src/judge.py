@@ -1,15 +1,32 @@
 """
 LLM-as-a-judge: call judge API (OpenAI or Anthropic) for structured JSON output.
 Supports OpenAI (gpt-*) and Anthropic (claude-*). Returns raw content and token usage.
+call_judge retries transient failures (429, 5xx, timeouts) with exponential backoff (see JUDGE_MAX_RETRIES).
 Raises RuntimeError if the selected provider's API key is not set.
 """
 
 import json
 import os
+import random
 import sys
+import time
 from typing import Optional
 
 JUDGE_TEMPERATURE = 0.0
+
+# Transient API failures (rate limits, 5xx, timeouts): retry with exponential backoff.
+JUDGE_MAX_RETRIES_DEFAULT = 5
+JUDGE_RETRY_BASE_SEC = 1.0
+
+
+def _max_judge_retries() -> int:
+    raw = (os.environ.get("JUDGE_MAX_RETRIES") or "").strip()
+    if not raw:
+        return JUDGE_MAX_RETRIES_DEFAULT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return JUDGE_MAX_RETRIES_DEFAULT
 
 # JSON schema for structured output: { score: int 0-100, justification: str }
 JUDGE_RESPONSE_SCHEMA = {
@@ -137,6 +154,92 @@ def is_claude_model(model_id):
     return model_id and str(model_id).strip().lower().startswith("claude")
 
 
+def _retryable_judge_error(exc: BaseException) -> bool:
+    """True for rate limits, server errors, and network timeouts — safe to retry once or more."""
+    if not isinstance(exc, Exception):
+        return False
+
+    try:
+        from openai import APIConnectionError, APITimeoutError, RateLimitError
+        from openai import BadRequestError, AuthenticationError
+
+        if isinstance(exc, (APIConnectionError, APITimeoutError, RateLimitError)):
+            return True
+        if isinstance(exc, (BadRequestError, AuthenticationError)):
+            return False
+        try:
+            from openai import PermissionDeniedError
+
+            if isinstance(exc, PermissionDeniedError):
+                return False
+        except ImportError:
+            pass
+        try:
+            from openai import InternalServerError as OAIInternalServerError
+
+            if isinstance(exc, OAIInternalServerError):
+                return True
+        except ImportError:
+            pass
+        try:
+            from openai import APIStatusError
+
+            if isinstance(exc, APIStatusError):
+                c = getattr(exc, "status_code", None)
+                if c == 429 or (c is not None and 500 <= c < 600):
+                    return True
+                return False
+        except ImportError:
+            pass
+    except ImportError:
+        pass
+
+    try:
+        import anthropic
+
+        if isinstance(exc, anthropic.APIConnectionError):
+            return True
+        if isinstance(exc, anthropic.RateLimitError):
+            return True
+        if hasattr(anthropic, "InternalServerError") and isinstance(
+            exc, anthropic.InternalServerError
+        ):
+            return True
+        c = getattr(exc, "status_code", None)
+        if c == 429 or (c is not None and 500 <= c < 600):
+            return True
+    except ImportError:
+        pass
+
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+
+    msg = str(exc).lower()
+    if "rate limit" in msg or "too many requests" in msg:
+        return True
+    if "timeout" in msg or "timed out" in msg:
+        return True
+    if "connection reset" in msg or "connection aborted" in msg:
+        return True
+    if "overloaded" in msg or "503" in msg:
+        return True
+    c = getattr(exc, "status_code", None)
+    if c == 429 or (c is not None and 500 <= c < 600):
+        return True
+    return False
+
+
+def _call_judge_once(
+    prompt: str,
+    model: str,
+    system_content: str,
+    temperature: float,
+):
+    if is_claude_model(model):
+        return _call_anthropic(prompt, model, system_content, temperature=temperature)
+    return _call_openai(prompt, model, system_content, temperature=temperature)
+
+
 def call_judge(
     prompt: str,
     model: str,
@@ -146,12 +249,43 @@ def call_judge(
     """
     Call judge LLM. Routes to OpenAI or Anthropic based on model id.
     Returns (raw_content_str, input_tokens, output_tokens).
-    Raises RuntimeError if API key not set or on failure.
+    Retries transient errors (429, 5xx, timeouts) with backoff; attempts = 1 + JUDGE_MAX_RETRIES (default 5).
+    Raises RuntimeError if API key not set or on non-retryable failure.
     """
     t = JUDGE_TEMPERATURE if temperature is None else temperature
-    if is_claude_model(model):
-        return _call_anthropic(prompt, model, system_content, temperature=t)
-    return _call_openai(prompt, model, system_content, temperature=t)
+    max_retries = _max_judge_retries()
+    attempts = max_retries + 1
+    last_exc: Optional[BaseException] = None
+    for attempt in range(attempts):
+        try:
+            return _call_judge_once(prompt, model, system_content, t)
+        except Exception as e:
+            last_exc = e
+            if attempt >= max_retries or not _retryable_judge_error(e):
+                raise
+            delay = JUDGE_RETRY_BASE_SEC * (2**attempt) + random.uniform(0, 0.35)
+            print(
+                f"[judge] transient error (attempt {attempt + 1}/{attempts}): {e!s}; "
+                f"retrying in {delay:.1f}s…",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
+def _openai_response_format_not_supported(err: BaseException) -> bool:
+    """True if the API rejected structured output mode for this model (e.g. base gpt-4)."""
+    msg = str(err).lower()
+    code = getattr(err, "status_code", None)
+    if code != 400:
+        return False
+    return (
+        "json_schema" in msg
+        or "response_format" in msg
+        or "structured" in msg
+        or "invalid parameter" in msg
+    )
 
 
 def _call_openai(prompt: str, model: str, system_content: str, temperature: float):
@@ -168,23 +302,51 @@ def _call_openai(prompt: str, model: str, system_content: str, temperature: floa
 
     print(f"[judge] Calling OpenAI ({model})...", file=sys.stderr)
     client = OpenAI(api_key=api_key.strip())
-    resp = client.chat.completions.create(
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": prompt},
+    ]
+    base_kw = dict(
         model=model,
-        messages=[
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": prompt},
-        ],
+        messages=messages,
         temperature=temperature,
         max_tokens=500,
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "judge_output",
-                "strict": True,
-                "schema": JUDGE_RESPONSE_SCHEMA,
-            },
-        },
     )
+    schema_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "judge_output",
+            "strict": True,
+            "schema": JUDGE_RESPONSE_SCHEMA,
+        },
+    }
+
+    def _complete(response_format: Optional[dict]):
+        kw = dict(base_kw)
+        if response_format is not None:
+            kw["response_format"] = response_format
+        return client.chat.completions.create(**kw)
+
+    try:
+        resp = _complete(schema_format)
+    except Exception as e:
+        if not _openai_response_format_not_supported(e):
+            raise
+        print(
+            f"[judge] json_schema not supported for {model}; retrying with json_object mode…",
+            file=sys.stderr,
+        )
+        try:
+            resp = _complete({"type": "json_object"})
+        except Exception as e2:
+            if not _openai_response_format_not_supported(e2):
+                raise
+            print(
+                f"[judge] json_object mode not supported for {model}; plain completion + parse…",
+                file=sys.stderr,
+            )
+            resp = _complete(None)
+
     content = ""
     if resp.choices and resp.choices[0].message.content:
         content = resp.choices[0].message.content.strip()

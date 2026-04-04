@@ -17,7 +17,7 @@ import streamlit as st
 
 # Allow importing from src when dashboard runs from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
-from constants import JUDGE_MODEL
+from constants import JUDGE_MODEL, JUDGE_MODEL_BATCH_PRESETS
 from judge import build_rubric_generator_user_prompt, call_text_model, is_claude_model
 from metric_rubric import METRIC_GLOSS_DEFAULTS, gloss_for_metric
 from run_repeated_judging import (
@@ -39,11 +39,20 @@ RESULTS_DIR = REPO_ROOT / "results"
 DATA_DIR = REPO_ROOT / "data"
 CONTENT_DIR = REPO_ROOT / "dashboard_content"
 
+# Run tab: show raw JSONL preview only after a completed run (cleared when a new run starts).
+_RUN_RAW_PREVIEW_PATH_KEY = "run_experiment_raw_preview_path"
+
 # Filename slug → condition_name (matches run_repeated_judging.CONDITION_FILENAME_SLUG)
 _COND_SLUG_TO_NAME = {
     "gen": "generic_overall",
     "metric": "metric_rubric",
     "custom": "per_item_custom",
+}
+# Run Experiment tab: radio labels → condition_name (matches Dataset A / B / C wording)
+RUN_CONDITION_LABEL_TO_NAME = {
+    "A — Generic overall": "generic_overall",
+    "B — Metric rubric": "metric_rubric",
+    "C — Per-item custom": "per_item_custom",
 }
 
 
@@ -168,17 +177,11 @@ _captions = _load_captions()
 _help = _load_help_text()
 load_dotenv(REPO_ROOT / ".env", override=False)
 
-# Preset judge / rubric-generator models (gpt-* → OpenAI, claude-* → Anthropic)
-JUDGE_MODEL_PRESETS = [
-    "gpt-4o-mini",
-    "gpt-4o",
-    "gpt-4",
-    "claude-sonnet-4-20250514",
-    "claude-opus-4-20250514",
-    "claude-haiku-4-5-20251001",
-    "claude-sonnet-4-6",
-    "Custom...",
-]
+# Run Experiment: single judge or “all presets” into one JSONL (order matches constants).
+RUN_ALL_JUDGES_LABEL = "Run all preset judges (one JSONL file)"
+JUDGE_MODEL_PRESETS = list(JUDGE_MODEL_BATCH_PRESETS) + [RUN_ALL_JUDGES_LABEL]
+# Dataset tab rubric generator: same model ids + custom id field.
+RUBRIC_GEN_MODEL_PRESETS = list(JUDGE_MODEL_BATCH_PRESETS) + ["Custom..."]
 
 
 # --- Page config and title ---
@@ -326,16 +329,16 @@ with tab_dataset:
                     )
                     rg1, rg2 = st.columns([3, 1])
                     with rg1:
-                        _preset_ids = [p for p in JUDGE_MODEL_PRESETS if p != "Custom..."]
+                        _preset_ids = [p for p in RUBRIC_GEN_MODEL_PRESETS if p != "Custom..."]
                         _env_m = (os.environ.get("JUDGE_MODEL") or JUDGE_MODEL).strip()
                         _rubric_idx = (
-                            JUDGE_MODEL_PRESETS.index(_env_m)
+                            RUBRIC_GEN_MODEL_PRESETS.index(_env_m)
                             if _env_m in _preset_ids
-                            else JUDGE_MODEL_PRESETS.index("Custom...")
+                            else RUBRIC_GEN_MODEL_PRESETS.index("Custom...")
                         )
                         rubric_model_pick = st.selectbox(
                             "Model for rubric generation",
-                            JUDGE_MODEL_PRESETS,
+                            RUBRIC_GEN_MODEL_PRESETS,
                             index=_rubric_idx,
                             key="rubric_gen_model_select",
                             help="Pick a preset or **Custom...** to type any model id (independent of the Run Experiment judge).",
@@ -928,33 +931,45 @@ with tab_compare:
 
 # ==================== TAB 2: Run Experiment ==============
 with tab_run:
-    st.header("Run Experiment")
-    st.caption(
-        "Each run writes `condition_name`, `dataset_id`, and score range on every JSONL row, and the filename includes "
-        "`_cond-gen_`, `_cond-custom_`, or `_cond-metric_`. Use **View Results** / **Compare Judges** filters to view "
-        "generic vs per-item-custom vs metric runs separately."
+    st.header(
+        "Run Experiment",
+        anchor=False,
+        help=_help_text("run_tab_header"),
     )
+    st.caption(_help_text("run_tab_caption") or "")
+
+    st.subheader(
+        "1 — Dataset & model",
+        anchor=False,
+        help=_help_text("run_section_setup"),
+    )
+    dataset_choice = st.selectbox(
+        "Dataset",
+        ["Subset (5 items)", "Full (30 items)"],
+        key="run_dataset",
+        help="Subset → `data/mt_bench_subset.json`. Full → `data/mt_bench_full.json` (build it first if missing).",
+    )
+    input_path = REPO_ROOT / "data" / ("mt_bench_full.json" if "Full" in dataset_choice else "mt_bench_subset.json")
 
     judge_choice = st.selectbox(
         "Judge model",
         JUDGE_MODEL_PRESETS,
         index=0,
         key="run_judge",
-        help="gpt-* → OpenAI; claude-* → Anthropic. Set OPENAI_API_KEY or ANTHROPIC_API_KEY in .env.",
+        help="One model, or **Run all preset judges** to loop every preset and append every row to **one** JSONL (needs **both** API keys if you mix OpenAI and Claude).",
     )
-    if judge_choice == "Custom...":
-        judge_choice = st.text_input(
-            "Custom judge model",
-            value="gpt-4o-mini",
-            key="run_judge_custom",
-            help="e.g. gpt-4o-mini (OpenAI) or claude-sonnet-4-20250514 (Anthropic)",
+    if judge_choice == RUN_ALL_JUDGES_LABEL:
+        st.warning(
+            f"**Batch run:** {len(JUDGE_MODEL_BATCH_PRESETS)} models × your dataset × K (× metrics under **B**). "
+            "Ensure **OPENAI_API_KEY** and **ANTHROPIC_API_KEY** are set if you use both families. "
+            "Each output line includes **`judge_model`** and **`multi_judge_run`: true**."
         )
     k_choice = st.selectbox(
         "Repeats per item (K)",
         [2, 3, 5, 10],
         index=2,
         key="run_k",
-        help="Default paper setting: K=5.",
+        help="Each item is judged K times. Total calls scale with K (and with number of metrics under **B**).",
     )
     temp_choice = st.number_input(
         "Temperature",
@@ -963,40 +978,61 @@ with tab_run:
         value=0.0,
         step=0.1,
         key="run_temp",
-        help="Default: 0 for reproducibility. Higher values increase randomness.",
+        help="0 = deterministic as the API allows; higher = more randomness.",
     )
-    condition_labels = {
-        "Generic overall": "generic_overall",
-        "Per-item custom": "per_item_custom",
-        "Metric rubric": "metric_rubric",
-    }
-    condition_display = st.selectbox(
-        "Condition",
-        list(condition_labels.keys()),
-        index=0,
-        key="run_condition",
-        help="Logged as condition_name on each row. Generic ignores judge_instructions; custom uses them; metric rubric runs one judge call per metric per item per repeat (B2).",
+
+    st.divider()
+    st.subheader(
+        "2 — Condition (A / B / C)",
+        anchor=False,
+        help=_help_text("run_section_condition"),
     )
-    condition_name = condition_labels[condition_display]
+    _cond_pick = st.radio(
+        "Choose condition",
+        list(RUN_CONDITION_LABEL_TO_NAME.keys()),
+        key="run_condition_radio",
+        horizontal=True,
+        help=_help_text("run_condition_radio"),
+    )
+    condition_name = RUN_CONDITION_LABEL_TO_NAME[_cond_pick]
+
+    st.divider()
+    st.subheader(
+        "3 — Options for this condition",
+        anchor=False,
+        help=_help_text("run_section_options"),
+    )
     metrics_pick_run: list = []
     if condition_name == "metric_rubric":
         _metric_options = sorted(METRIC_GLOSS_DEFAULTS.keys())
-        _default_metrics = [m for m in ("accuracy", "helpfulness", "relevance") if m in METRIC_GLOSS_DEFAULTS]
         metrics_pick_run = st.multiselect(
-            "Metrics",
+            "Metrics to score",
             options=_metric_options,
-            default=_default_metrics,
+            default=_metric_options,
             key="run_metrics_multiselect",
-            help="Select one or more dimensions from metric_rubric.py. One judge call per item × repeat × metric.",
+            help="Each selected metric adds a separate judge call for every item × repeat. Total calls ≈ items × K × (number of metrics).",
         )
-    dataset_choice = st.selectbox(
-        "Dataset",
-        ["Subset (5 items)", "Full (30 items)"],
-        key="run_dataset",
-        help="Subset = mt_bench_subset.json. Full = mt_bench_full.json (run build_mt_bench_full.py first if missing).",
-    )
-    input_path = REPO_ROOT / "data" / ("mt_bench_full.json" if "Full" in dataset_choice else "mt_bench_subset.json")
+        st.info(
+            "**B — Metric rubric:** tune the list above. Preview prompts under **Dataset & prompts → B**."
+        )
+    elif condition_name == "generic_overall":
+        st.info(
+            "**A — Generic overall:** no extra options. **judge_instructions** in the JSON are **not** used. "
+            "Edit the file on **Dataset & prompts**."
+        )
+    else:
+        st.info(
+            "**C — Per-item custom:** each row’s **judge_instructions** are injected into the judge prompt. "
+            "Fill them on **Dataset & prompts** (or use **Generate custom judge instructions**)."
+        )
 
+    st.subheader(
+        "Total records (this run)",
+        anchor=False,
+        help=_help_text("run_total_records_formula"),
+    )
+
+    st.divider()
     if st.button("Run experiment", type="primary", key="run_btn"):
         if "Full" in dataset_choice and not input_path.exists():
             st.error("mt_bench_full.json not found. Run: python src/build_mt_bench_full.py")
@@ -1006,43 +1042,86 @@ with tab_run:
             if condition_name == "metric_rubric":
                 metric_names_arg = list(metrics_pick_run)
                 if not metric_names_arg:
-                    st.error("Condition B requires at least one metric — select one or more in the Metrics list.")
+                    st.error(
+                        "**Metric rubric** needs at least one metric — select one or more under **Metrics to score**."
+                    )
                     block_run = True
             if not block_run and (condition_name != "metric_rubric" or metric_names_arg):
-                with st.spinner("Running experiment (calling judge API)..."):
-                    try:
-                        out_path = run_experiment(
+                st.session_state[_RUN_RAW_PREVIEW_PATH_KEY] = None
+                progress_ph = st.progress(0)
+                cap_ph = st.caption("Preparing run…")
+
+                def _experiment_progress(done: int, total: int) -> None:
+                    if total <= 0:
+                        return
+                    p = min(float(done) / float(total), 1.0)
+                    progress_ph.progress(p)
+                    cap_ph.caption(f"Judgments written: **{done}** / **{total}**")
+
+                try:
+                    _run_kw = dict(
+                        repeats=k_choice,
+                        input_path=str(input_path),
+                        temperature=float(temp_choice),
+                        condition_name=condition_name,
+                        metric_names=metric_names_arg,
+                        dataset_id=input_path.stem,
+                        progress_callback=_experiment_progress,
+                    )
+                    if judge_choice == RUN_ALL_JUDGES_LABEL:
+                        result = run_experiment(
+                            judge_models=list(JUDGE_MODEL_BATCH_PRESETS),
+                            **_run_kw,
+                        )
+                    else:
+                        result = run_experiment(
                             judge_model=judge_choice,
-                            repeats=k_choice,
-                            input_path=str(input_path),
-                            temperature=float(temp_choice),
-                            condition_name=condition_name,
-                            metric_names=metric_names_arg,
-                            dataset_id=input_path.stem,
+                            **_run_kw,
                         )
-                        _slug = CONDITION_FILENAME_SLUG.get(
-                            condition_name,
-                            condition_name.replace("_", "")[:12],
-                        )
-                        st.success(f"Done. Output: {out_path}")
-                        st.info(
-                            f"Tagged **{condition_name}** · dataset **{input_path.stem}** · look for `_cond-{_slug}_` in the "
-                            "filename. On **View Results** / **Compare Judges**, set Condition (and Dataset) filters to this run."
-                        )
-                    except Exception as e:
-                        st.error(str(e))
+                    out_path = result["output_path"]
+                    exp_n = result["expected_rows"]
+                    got_n = result["written_rows"]
+                    progress_ph.progress(1.0)
+                    cap_ph.caption(f"Complete: **{got_n}** / **{exp_n}** records (validated).")
+                    _slug = CONDITION_FILENAME_SLUG.get(
+                        condition_name,
+                        condition_name.replace("_", "")[:12],
+                    )
+                    st.success(
+                        f"Done. Output: `{out_path}` — **{got_n}** records written "
+                        f"(expected **{exp_n}**; counts match)."
+                    )
+                    st.info(
+                        f"Tagged **{condition_name}** · dataset **{input_path.stem}** · look for `_cond-{_slug}_` in the "
+                        "filename. On **View Results** / **Compare Judges**, set **Condition** (and **Dataset**) to this run."
+                    )
+                    st.session_state[_RUN_RAW_PREVIEW_PATH_KEY] = str(out_path)
+                except Exception as e:
+                    st.error(str(e))
 
     st.divider()
-    jsonl_files = list(RESULTS_DIR.glob("*.jsonl")) if RESULTS_DIR.exists() else []
-    if jsonl_files:
-        latest = max(jsonl_files, key=lambda p: p.stat().st_mtime)
-        st.subheader("Latest results (raw)")
-        st.caption(f"{latest.name}")
-        rows = load_jsonl(latest)
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    _preview_raw = st.session_state.get(_RUN_RAW_PREVIEW_PATH_KEY)
+    if not _preview_raw:
+        st.caption(
+            "Raw JSONL preview appears here **after** a completed run on this tab (cleared when you start another run)."
+        )
+    else:
+        _preview_path = Path(_preview_raw)
+        if _preview_path.is_file():
+            st.subheader(
+                "This run — raw JSONL preview",
+                anchor=False,
+                help=_help_text("run_latest_results_raw"),
+            )
+            st.caption(_preview_path.name)
+            rows = load_jsonl(_preview_path)
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            else:
+                st.info("File is empty.")
         else:
-            st.info("File is empty.")
+            st.session_state[_RUN_RAW_PREVIEW_PATH_KEY] = None
+            st.warning("Preview file is no longer on disk; cleared.")
 
 
 
