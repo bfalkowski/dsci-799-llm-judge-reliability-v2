@@ -17,6 +17,71 @@ h1, h2, h3 {
     margin: 1rem 0 0.75rem 0;
     box-shadow: 0 2px 4px rgba(0,0,0,0.08);
 }
+
+/*
+ * Headings with st.subheader(..., help=…): Streamlit puts the title + help control
+ * inside the same h1/h2/h3 (siblings in the heading element), so flex must target
+ * that heading — not the outer wrapper (which only has one child).
+ */
+div[data-testid="stElementContainer"]:has([data-testid="stHeadingWithActionElements"]) {
+    width: 100% !important;
+    max-width: 100% !important;
+}
+
+[data-testid="stHeadingWithActionElements"] {
+    width: 100% !important;
+    box-sizing: border-box !important;
+    background: linear-gradient(135deg, #1e40af 0%, #3b82f6 100%) !important;
+    color: rgba(255, 255, 255, 0.98) !important;
+    padding: 0.75rem 1.25rem !important;
+    border-radius: 0.5rem !important;
+    margin: 1rem 0 0.75rem 0 !important;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.08) !important;
+}
+
+[data-testid="stHeadingWithActionElements"] h1,
+[data-testid="stHeadingWithActionElements"] h2,
+[data-testid="stHeadingWithActionElements"] h3 {
+    display: flex !important;
+    flex-direction: row !important;
+    align-items: center !important;
+    justify-content: flex-start !important;
+    gap: 0.75rem !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    color: white !important;
+    min-width: 0 !important;
+}
+
+/* Help widget may be wrapped; push the last heading child to the right */
+[data-testid="stHeadingWithActionElements"] h1 > *:last-child,
+[data-testid="stHeadingWithActionElements"] h2 > *:last-child,
+[data-testid="stHeadingWithActionElements"] h3 > *:last-child {
+    margin-left: auto !important;
+    flex-shrink: 0 !important;
+}
+
+[data-testid="stHeadingWithActionElements"] button,
+[data-testid="stHeadingWithActionElements"] [data-baseweb="button"] {
+    color: rgba(255, 255, 255, 0.95) !important;
+}
+
+/*
+ * Help uses SVG paths with fixed fill — color: on the button does not recolor it.
+ * Apply filter only on the help cluster (last flex child), not on title markdown.
+ */
+[data-testid="stHeadingWithActionElements"] h1 > *:last-child svg,
+[data-testid="stHeadingWithActionElements"] h2 > *:last-child svg,
+[data-testid="stHeadingWithActionElements"] h3 > *:last-child svg {
+    filter: brightness(0) invert(1);
+    opacity: 0.92;
+}
+
 /* Tabs: larger, easier to read */
 .stTabs [data-baseweb="tab-list"] {
     gap: 0.25rem;

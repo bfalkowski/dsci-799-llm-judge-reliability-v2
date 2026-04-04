@@ -1,0 +1,8 @@
+{
+  "dataset_tab_header": "Pick a benchmark JSON, edit **question**, **response**, and optional **judge_instructions** for each row, and save. **judge_instructions** matter for **Per-item custom** runs only; use the sections below to generate rubrics or preview judge prompts.",
+  "dataset_generate_rubrics": "Calls an LLM once per row to write **judge_instructions** (add/deduct style, 0–100) from the question and reference answer. Overwrites every row when finished; needs your API key in **.env**.",
+  "dataset_judge_previews_intro": "Matches **Run Experiment** conditions **A → B → C**. **A** and **B** show the shared wording (simple substitutions at run time). **C** is the only place you see the **full message for one table row**, including **judge_instructions**.",
+  "dataset_prompt_generic": "Same as **Generic overall** on **Run Experiment**: one holistic 0–100 score. The template is unchanged; **question**, **response**, and an empty rubric slot are filled per item when you run.",
+  "dataset_prompt_per_item_custom": "Same as **Per-item custom** on **Run Experiment**. Preview the **exact judge message** for one row—including **judge_instructions**—using your current table (even unsaved edits).",
+  "dataset_metric_prompts": "Same as **Metric rubric** on **Run Experiment**: pick a criterion to see the prompt with that definition filled in and **{question}** / **{response}** left as the per-row slots."
+}

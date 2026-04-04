@@ -1,7 +1,4 @@
-"""
-LLM-as-a-Judge Reliability Dashboard (STUB)
-
-"""
+"""Streamlit dashboard for LLM-as-a-judge reliability experiments."""
 
 import json
 import os
@@ -22,8 +19,13 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 from constants import JUDGE_MODEL
 from judge import build_rubric_generator_user_prompt, call_text_model, is_claude_model
-from metric_rubric import METRIC_GLOSS_DEFAULTS
-from run_repeated_judging import CONDITION_FILENAME_SLUG
+from metric_rubric import METRIC_GLOSS_DEFAULTS, gloss_for_metric
+from run_repeated_judging import (
+    CONDITION_FILENAME_SLUG,
+    load_judge_metric_prompt,
+    load_judge_prompt,
+    run_experiment,
+)
 from compute_metrics import (
     _group_by_item,
     metric1_per_item_variance,
@@ -140,7 +142,30 @@ def _load_captions():
         return {}
 
 
+def _load_help_text():
+    """Load heading/tooltip copy from dashboard_content/help_text.json. Returns dict, empty on error."""
+    path = CONTENT_DIR / "help_text.json"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, encoding=ENCODING) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _help_text(key: str) -> Optional[str]:
+    """Non-empty string for st.title/header/subheader `help=`, or None if missing or blank."""
+    raw = _help.get(key)
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    return s if s else None
+
+
 _captions = _load_captions()
+_help = _load_help_text()
 load_dotenv(REPO_ROOT / ".env", override=False)
 
 # Preset judge / rubric-generator models (gpt-* → OpenAI, claude-* → Anthropic)
@@ -197,7 +222,6 @@ tab_overview, tab_dataset, tab_run, tab_view, tab_compare, tab_otel, tab_manage 
 
 # ==================== TAB 1:  Overview ====================
 with tab_overview:
-    # TODO: Load and render dashboard_content/overview.md
     overview_md = _load_content("overview")
     if overview_md:
 
@@ -210,10 +234,14 @@ with tab_overview:
 
 # ==================== TAB: Dataset & prompts ====================
 with tab_dataset:
-    st.header("Dataset & prompts")
+    st.header(
+        "Dataset & prompts",
+        anchor=False,
+        help=_help_text("dataset_tab_header"),
+    )
     st.caption(
-        "View and edit the judge dataset JSON. Each item can include **judge_instructions** "
-        "(per-item custom rubric for condition C). Empty instructions = generic prompt only."
+        "View and edit the judge dataset JSON. **judge_instructions** are used for **Per-item custom** runs only; "
+        "they are ignored for **Generic overall**. **Metric rubric** uses separate prompts (see previews below)."
     )
     paths = _discover_dataset_paths()
     if not paths:
@@ -287,7 +315,11 @@ with tab_dataset:
                         st.caption("Commit saved files in git so runs stay reproducible.")
 
                     st.divider()
-                    st.subheader("Generate custom judge instructions")
+                    st.subheader(
+                        "Generate custom judge instructions",
+                        anchor=False,
+                        help=_help_text("dataset_generate_rubrics"),
+                    )
                     st.caption(
                         "One API call per row using the question and reference response. Fills **judge_instructions** "
                         "with add/deduct scoring guidance for a 0–100 scale. **Re-run overwrites** every row; the file is saved when finished."
@@ -377,32 +409,88 @@ with tab_dataset:
                                 st.session_state["dataset_rubric_feedback"] = fb
                                 st.rerun()
 
-                    st.subheader("Prompt preview")
-                    from run_repeated_judging import load_judge_prompt
-
+                    st.divider()
+                    st.subheader(
+                        "Judge prompt previews",
+                        anchor=False,
+                        help=_help_text("dataset_judge_previews_intro"),
+                    )
+                    st.caption("**A**, **B**, **C** align with **Run Experiment**. Hover **ⓘ** on each blue title for a short explanation.")
                     tmpl = load_judge_prompt()
                     preview_ids = [str(r["item_id"]) for r in records]
-                    pick = st.selectbox("Item", preview_ids, key="dataset_preview_item")
-                    preview_row = next((r for r in records if str(r["item_id"]) == pick), None)
-                    if preview_row:
-                        # Use editor values if user changed them but didn’t save — align with current dataframe
-                        erow = edited[edited["item_id"].astype(str) == pick].iloc[0]
-                        q, resp = str(erow["question"]), str(erow["response"])
-                        raw_instr = str(erow.get("judge_instructions", "") or "").strip()
-                        rubric = (
-                            f"Item-specific judge instructions:\n{raw_instr}\n\n"
-                            if raw_instr
+
+                    st.subheader(
+                        "A — Generic overall",
+                        anchor=False,
+                        help=_help_text("dataset_prompt_generic"),
+                    )
+                    with st.expander("Show template", expanded=False):
+                        st.code(tmpl, language=None)
+
+                    st.subheader(
+                        "B — Metric rubric",
+                        anchor=False,
+                        help=_help_text("dataset_metric_prompts"),
+                    )
+                    with st.expander("Show criterion table & prompt preview", expanded=False):
+                        _metric_keys = sorted(METRIC_GLOSS_DEFAULTS.keys())
+                        st.caption("**Criterion definitions** (long text scrolls inside the table)")
+                        st.dataframe(
+                            pd.DataFrame(
+                                [{"metric": k, "gloss": METRIC_GLOSS_DEFAULTS[k]} for k in _metric_keys]
+                            ),
+                            hide_index=True,
+                            use_container_width=True,
+                            height=240,
+                        )
+                        _metric_pick = st.selectbox(
+                            "Criterion to preview",
+                            _metric_keys,
+                            key="dataset_metric_criterion",
+                        )
+                        _mtpl = load_judge_metric_prompt()
+                        try:
+                            _mgloss = gloss_for_metric(_metric_pick)
+                            _m_shape = _mtpl.format(
+                                metric_name=_metric_pick,
+                                metric_gloss=_mgloss,
+                                question="{question}",
+                                response="{response}",
+                            )
+                        except (KeyError, ValueError) as e:
+                            _m_shape = f"(Could not build preview: {e})"
+                        st.code(_m_shape, language=None)
+
+                    st.subheader(
+                        "C — Per-item custom",
+                        anchor=False,
+                        help=_help_text("dataset_prompt_per_item_custom"),
+                    )
+                    with st.expander("Show filled prompt for one row", expanded=False):
+                        _c_item = st.selectbox(
+                            "Row to preview",
+                            preview_ids,
+                            key="dataset_preview_item_custom",
+                            help="Uses this row’s question, response, and judge_instructions (including unsaved edits).",
+                        )
+                        _crow = edited[edited["item_id"].astype(str) == _c_item].iloc[0]
+                        _cq = str(_crow["question"])
+                        _cr = str(_crow["response"])
+                        _ci = str(_crow.get("judge_instructions", "") or "").strip()
+                        _crubric = (
+                            f"Item-specific judge instructions:\n{_ci}\n\n"
+                            if _ci
                             else ""
                         )
                         try:
-                            filled = tmpl.format(
-                                question=q,
-                                response=resp,
-                                item_specific_rubric=rubric,
+                            _filled_c = tmpl.format(
+                                question=_cq,
+                                response=_cr,
+                                item_specific_rubric=_crubric,
                             )
                         except KeyError as e:
-                            filled = f"(Template missing placeholder: {e})"
-                        st.code(filled, language=None)
+                            _filled_c = f"(Template missing placeholder: {e})"
+                        st.code(_filled_c, language=None)
 
 
 # ==================== TAB 2: View Results ====================
@@ -923,8 +1011,6 @@ with tab_run:
             if not block_run and (condition_name != "metric_rubric" or metric_names_arg):
                 with st.spinner("Running experiment (calling judge API)..."):
                     try:
-                        from run_repeated_judging import run_experiment
-
                         out_path = run_experiment(
                             judge_model=judge_choice,
                             repeats=k_choice,
