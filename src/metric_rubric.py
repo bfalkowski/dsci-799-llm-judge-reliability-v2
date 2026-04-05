@@ -8,12 +8,6 @@ METRIC_GLOSS_DEFAULTS = {
         "If the question is subjective or underspecified, judge plausibility and absence of obvious falsehoods, "
         "not your own preferred opinion."
     ),
-    "helpfulness": (
-        "Whether the answer would actually help a user who asked the question: it should move them toward "
-        "resolution (steps, explanation, or a usable outcome) without unnecessary friction. "
-        "Penalize evasive, generic, or misleading content even if polished. "
-        "Tone and politeness matter only insofar as they block or enable understanding."
-    ),
     "relevance": (
         "How tightly the content addresses **what was asked**: the stated topic, constraints, and intent. "
         "Penalize topic drift, padding unrelated to the question, or answering a different question. "
@@ -26,13 +20,6 @@ METRIC_GLOSS_DEFAULTS = {
         "Reward addressing each important piece; penalize skipping a major requested element or only hand-waving "
         "where specifics were expected. "
         "Do not require extra topics the question did not suggest; brevity is fine if nothing material is missing."
-    ),
-    "clarity": (
-        "How easy the answer is to read and follow: logical flow, explicit structure when helpful, precise wording, "
-        "and minimal ambiguity. "
-        "Penalize confusion from jumbled order, undefined jargon without explanation, or sentences so vague "
-        "that the main point is unclear. "
-        "Do not downscore solely for length or style if the reasoning is still easy to track."
     ),
 }
 

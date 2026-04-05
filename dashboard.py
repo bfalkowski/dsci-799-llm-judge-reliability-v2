@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -31,6 +32,7 @@ from compute_metrics import (
     metric1_per_item_variance,
     metric2_exact_agreement,
     metric3_score_histogram,
+    metric_repeat_variability_headlines,
     otel_metrics,
     variance,
 )
@@ -54,6 +56,10 @@ RUN_CONDITION_LABEL_TO_NAME = {
     "B — Metric rubric": "metric_rubric",
     "C — Per-item custom": "per_item_custom",
 }
+
+# Run Experiment: output destination (radio value → must match key= storage)
+_RUN_OUTPUT_NEW_JSONL = "new_jsonl"
+_RUN_OUTPUT_RESUME_JSONL = "resume_jsonl"
 
 
 def _first_jsonl_row(path: Path) -> dict:
@@ -82,6 +88,9 @@ def _condition_label_for_file(path: Path, first_row: Optional[dict] = None) -> s
 
 def _summarize_result_file(path: Path) -> dict:
     row = _first_jsonl_row(path)
+    multi_flag = bool(row.get("multi_judge_run"))
+    if not multi_flag and "multi" in path.name and "judges" in path.name:
+        multi_flag = True
     return {
         "path": path,
         "name": path.name,
@@ -89,6 +98,7 @@ def _summarize_result_file(path: Path) -> dict:
         "dataset_id": (str(row.get("dataset_id") or "").strip() or "—"),
         "judge_model": str(row.get("judge_model") or "—"),
         "metric_name": row.get("metric_name"),
+        "multi_judge_run": multi_flag,
     }
 
 
@@ -104,6 +114,103 @@ def _rows_for_single_metric(rows: list, metric_name: Optional[str]):
     if metric_name is None:
         return rows
     return [r for r in rows if str(r.get("metric_name")) == str(metric_name)]
+
+
+def _unique_judge_models_in_rows(rows: list) -> list:
+    """Preserve first-seen order of distinct judge_model values (non-empty strings)."""
+    seen: list = []
+    for r in rows:
+        j = r.get("judge_model")
+        if j is None:
+            continue
+        sj = str(j).strip()
+        if sj and sj not in seen:
+            seen.append(sj)
+    return seen
+
+
+def _rows_for_judge_model(rows: list, judge_model: str) -> list:
+    jm = str(judge_model).strip()
+    return [r for r in rows if str(r.get("judge_model", "")).strip() == jm]
+
+
+def _short_run_tag_from_results_filename(fname: str) -> str:
+    """
+    Compact run id from results filename: UTC stamp plus optional condition slug and K
+    (e.g. gen · K2 · 20260404T184805) so tables and charts do not show the full basename.
+    """
+    name = Path(fname).name
+    m_time = re.search(r"_(\d{8}T\d{6})\.jsonl$", name)
+    stamp = m_time.group(1) if m_time else ""
+    m_cond = re.search(r"_cond-([^_]+)_", name)
+    cond = (m_cond.group(1) if m_cond else "").strip()
+    m_k = re.search(r"_K(\d+)_", name)
+    k_part = f"K{m_k.group(1)}" if m_k else ""
+    parts = [p for p in (cond, k_part, stamp) if p]
+    if parts:
+        return " · ".join(parts)
+    stem = Path(name).stem
+    if stem.startswith("mtbench_judge-"):
+        stem = stem[len("mtbench_judge-") :]
+    return stem[:40] + ("…" if len(stem) > 40 else "")
+
+
+def _compare_slice_label(fname: str, judge_key: str) -> str:
+    """Disambiguate duplicate model ids: model plus short run tag from filename."""
+    tag = _short_run_tag_from_results_filename(fname)
+    return f"{judge_key} · {tag}"
+
+
+def _compare_result_file_pick_label(s: dict) -> str:
+    """Short label for Compare tab file multiselect (no long basename)."""
+    tag = _short_run_tag_from_results_filename(s["name"])
+    mj = " · multi-judge" if s.get("multi_judge_run") else ""
+    return f"{tag}{mj}  ·  {s['condition']}  ·  {s['dataset_id']}"
+
+
+def _disambiguate_compare_slice_labels(slices: list) -> None:
+    """Prefer bare model id (`gpt-4o-mini`); add run tag only when the same model appears on multiple slices."""
+    if not slices:
+        return
+    counts = Counter(str(s["judge_key"]).strip() for s in slices)
+    for s in slices:
+        jk = str(s["judge_key"]).strip()
+        if counts[jk] > 1:
+            s["label"] = _compare_slice_label(s["fname"], jk)
+        else:
+            s["label"] = jk
+
+
+def _api_vendor_label(judge_key: str) -> str:
+    """Bucket for cross-provider comparison (batch runs mix OpenAI and Anthropic)."""
+    if is_claude_model(judge_key):
+        return "Anthropic"
+    return "OpenAI"
+
+
+def _iter_judge_slices_for_compare(
+    fname: str,
+    rows: list,
+):
+    """
+    Yield (judge_key, slice_rows) for one file after metric filter.
+    judge_key is used for labeling; slice_rows are only that judge's rows.
+    """
+    judges = _unique_judge_models_in_rows(rows)
+    if not judges:
+        if not rows:
+            return
+        jb = (
+            fname.replace("mtbench_judge-", "").split("_K")[0]
+            if "mtbench_judge-" in fname
+            else fname
+        )
+        yield jb, rows
+        return
+    for j in judges:
+        part = _rows_for_judge_model(rows, j)
+        if part:
+            yield j, part
 
 
 def _normalize_judge_dataset(data):
@@ -206,7 +313,7 @@ tab_names = [
     "Dataset & prompts",
     "Run Experiment",
     "View Results",
-    "Compare Judges",
+    "Compare judges & vendors",
     "Telemetry",
     "Manage",
 ]
@@ -436,7 +543,7 @@ with tab_dataset:
                         help=_help_text("dataset_metric_prompts"),
                     )
                     with st.expander("Show criterion table & prompt preview", expanded=False):
-                        _metric_keys = sorted(METRIC_GLOSS_DEFAULTS.keys())
+                        _metric_keys = list(METRIC_GLOSS_DEFAULTS.keys())
                         st.caption("**Criterion definitions** (long text scrolls inside the table)")
                         st.dataframe(
                             pd.DataFrame(
@@ -503,6 +610,10 @@ with tab_view:
         st.info("No result files in results")
     else:
         st.caption(
+            "One JSONL can include several **judge_model** values — pick a model below so metrics use only that slice. "
+            "For OpenAI vs Anthropic rollups across judges, use **Compare judges & vendors**."
+        )
+        st.caption(
             "Filter by **condition** and **dataset** so you only see runs from one experiment design at a time "
             "(new runs log `condition_name` on every row and encode `_cond-gen|metric|custom_` in the filename)."
         )
@@ -544,7 +655,21 @@ with tab_view:
             path = RESULTS_DIR / selected
             rows = load_jsonl(path)
             if rows:
-                df = pd.DataFrame(rows)
+                judges_in_file = _unique_judge_models_in_rows(rows)
+                if len(judges_in_file) > 1:
+                    _vj = st.selectbox(
+                        "Judge model (required for multi-judge files)",
+                        judges_in_file,
+                        key=f"view_judge_model__{selected}",
+                        help=(
+                            "This file contains multiple **judge_model** values. All metrics and charts use **only** "
+                            "the selected model’s rows."
+                        ),
+                    )
+                    rows = _rows_for_judge_model(rows, _vj)
+                elif len(judges_in_file) == 1:
+                    rows = _rows_for_judge_model(rows, judges_in_file[0])
+
                 metric_opts = sorted(
                     {str(r["metric_name"]) for r in rows if r.get("metric_name")},
                     key=str,
@@ -562,26 +687,67 @@ with tab_view:
                     )
 
                 rows_m = _rows_for_single_metric(rows, view_metric_filter)
+                df = pd.DataFrame(rows_m)
                 by_item = _group_by_item(rows_m)
+                hl = metric_repeat_variability_headlines(by_item)
                 m1 = metric1_per_item_variance(by_item)
                 m2 = metric2_exact_agreement(by_item)
                 counts = metric3_score_histogram(rows_m)
+
+                st.subheader("Repeat variability")
+                if hl["n_judgments"]:
+                    st.markdown(
+                        f"**{hl['n_distinct_scores']} different scores** across **{hl['n_judgments']}** judgments on the same items. "
+                        f"**Within-item** repeat pairs disagreed **{hl['pct_repeat_pairs_disagree']:.0f}%** of the time "
+                        f"**({hl['n_repeat_pairs_disagree']}/{hl['n_repeat_pairs']} pairs)**. "
+                        f"**{hl['pct_items_any_repeat_disagree']:.0f}%** of items **({hl['n_items_any_repeat_disagree']}/{hl['n_items']})** "
+                        f"had at least one disagreeing repeat pair."
+                    )
+                    c0a, c0b, c0c = st.columns(3)
+                    with c0a:
+                        st.metric(
+                            "Distinct scores / judgments",
+                            f"{hl['n_distinct_scores']} / {hl['n_judgments']}",
+                        )
+                    with c0b:
+                        st.metric("Repeat pairs disagreeing", f"{hl['pct_repeat_pairs_disagree']:.0f}%")
+                        st.caption(
+                            f"**{hl['n_repeat_pairs_disagree']}** / **{hl['n_repeat_pairs']}** within-item pairs differ."
+                        )
+                    with c0c:
+                        st.metric("Items with any repeat disagreement", f"{hl['pct_items_any_repeat_disagree']:.0f}%")
+                        st.caption(
+                            f"**{hl['n_items_any_repeat_disagree']}** / **{hl['n_items']}** items (max ≠ min repeats)."
+                        )
+                else:
+                    st.info("No scored judgments in this slice.")
     
                 # Metrics section
-                st.subheader("Reliability metrics")
+                st.subheader("Reliability metrics (detail)")
+                st.caption(
+                    "**Mean variance** averages per-item **sample** variances (divide by K−1 within each item). "
+                    "With **K=2**, one wild item can inflate the mean — use **Repeat variability** above and **Avg spread** below."
+                )
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
-                    st.metric("Mean variance", f"{m1['mean_variance']:.4f}")
-                    st.caption("Per-item score variance across K runs")
+                    st.metric("Avg score spread (points)", f"{m1['mean_within_item_range']:.2f}")
+                    st.caption("Mean of max−min repeat scores per item (0–100 scale). With K=2 = mean |Δscore|.")
                 with col2:
-                    st.metric("Mean within-item SD", f"{m1['mean_within_item_std']:.3f}")
-                    st.caption("Average √(per-item variance); same units as score (0–100). 0 = perfectly stable repeats.")
+                    st.metric("Mean variance", f"{m1['mean_variance']:.4f}")
+                    st.caption(f"Median: **{m1['median_variance']:.2f}** · worst item spread: **{m1['max_within_item_range']:.0f}** pts")
                 with col3:
-                    st.metric("% zero variance", f"{m1['pct_items_zero_variance']:.1f}%")
-                    st.caption(f"{m1['zero_var_count']} / {m1['n_items']} items")
+                    st.metric("Mean within-item SD", f"{m1['mean_within_item_std']:.3f}")
+                    st.caption("Mean √(per-item sample variance); same units as score.")
                 with col4:
+                    st.metric("% zero variance", f"{m1['pct_items_zero_variance']:.1f}%")
+                    st.caption(f"{m1['zero_var_count']} / {m1['n_items']} items · identical repeats")
+                col5, col6 = st.columns(2)
+                with col5:
                     st.metric("Repeat agreement (exact)", f"{m2['mean_agreement_rate']:.1%}")
-                    st.caption("Per item: fraction of repeat pairs with identical integer score; then mean over items—not the same as mean score.")
+                    st.caption("Per item: share of repeat pairs with same integer score; mean over items.")
+                with col6:
+                    st.metric("Items analyzed", f"{m1['n_items']}")
+                    st.caption("Distinct item_ids in this slice")
     
                 # Overall reliability: stable vs unstable
                 st.subheader("Overall reliability")
@@ -667,19 +833,26 @@ with tab_view:
                 else:
                     st.info("No scores to display.")
     
-                with st.expander("Raw judgments", expanded=True):
-                    st.dataframe(df, use_container_width=True)
+                with st.expander("Judgments reflected above", expanded=False):
+                    st.caption(
+                        "Same rows as the **metrics and charts**: selected **judge model** and (under condition **B**) the "
+                        "chosen **metric** only — not the full JSONL."
+                    )
+                    if df.empty:
+                        st.info("No rows after filters.")
+                    else:
+                        st.dataframe(df, use_container_width=True)
 
             else:
                 st.info("File is empty.")
 
 
-# ==================== TAB 4: Compare Judges ==============
+# ==================== TAB 4: Compare judges & vendors ==============
 with tab_compare:
-    st.header("Compare Judges")
+    st.header("Compare judges & vendors")
     st.caption(
-        "Pick **condition**, then **dataset** — only result files that match both are available to compare. "
-        "Run the same condition and dataset across judges for a valid comparison."
+        "Pick **condition** and **dataset**, then one or more result files. Tables split by **judge_model**; "
+        "the **API vendor** block aggregates OpenAI vs Anthropic judges when both appear in your selection."
     )
     summaries_cmp = _all_result_summaries()
     if not summaries_cmp:
@@ -714,23 +887,34 @@ with tab_compare:
                 for s in summaries_cmp
                 if s["condition"] == cond_filter_cmp and s["dataset_id"] == dset_filter_cmp
             ]
-        cmp_labels = [
-            f"{s['name']}  ·  {s['condition']}  ·  {s['dataset_id']}  ·  {s['judge_model']}"
-            for s in filtered_cmp
-        ]
-        _cmp_label_to_name = {cmp_labels[i]: filtered_cmp[i]["name"] for i in range(len(filtered_cmp))}
+        _cmp_label_to_name = {}
+        cmp_labels = []
+        for s in filtered_cmp:
+            base = _compare_result_file_pick_label(s)
+            label = base
+            n = 2
+            while label in _cmp_label_to_name:
+                label = f"{base} ({n})"
+                n += 1
+            _cmp_label_to_name[label] = s["name"]
+            cmp_labels.append(label)
         pick_cmp = st.multiselect(
-            "3. Result files (select 2+ judges)",
+            "3. Result files",
             cmp_labels,
             default=[],
             key="compare_files_pick",
+            help=(
+                "Pick **one** multi-judge JSONL to compare judges inside it, or **two or more** files (any mix). "
+                "Each file is loaded **once**; rows are split by **judge_model** so variance and agreement stay within-judge."
+            ),
         )
         selected = [_cmp_label_to_name[L] for L in pick_cmp]
-        if len(selected) < 2:
-            st.info("Select at least 2 files to compare.")
+        if len(selected) < 1:
+            st.info("Select at least one result file.")
         else:
+            loaded_cmp = {fn: load_jsonl(RESULTS_DIR / fn) for fn in selected}
             metric_sets = [
-                {str(r["metric_name"]) for r in load_jsonl(RESULTS_DIR / fn) if r.get("metric_name")}
+                {str(r["metric_name"]) for r in loaded_cmp[fn] if r.get("metric_name")}
                 for fn in selected
             ]
             compare_metric_choice = None
@@ -759,62 +943,167 @@ with tab_compare:
             if skip_compare:
                 st.info("Pick files that share the same metrics to compare condition B results.")
             else:
-                # Load each file and compute metrics
-                compare_data = []
-                skipped = []
+                compare_slices = []
                 for fname in selected:
                     path = RESULTS_DIR / fname
                     summ = _summarize_result_file(path)
-                    rows = load_jsonl(path)
-                    if compare_metric_choice is not None:
-                        rows = [r for r in rows if str(r.get("metric_name")) == str(compare_metric_choice)]
-                    if not rows:
-                        # Extract judge name from filename (mtbench_judge-XYZ_K...)
-                        judge = fname.replace("mtbench_judge-", "").split("_K")[0] if "mtbench_judge-" in fname else fname
+                    rows_metric = _rows_for_single_metric(loaded_cmp[fname], compare_metric_choice)
+                    for judge_key, slice_rows in _iter_judge_slices_for_compare(fname, rows_metric):
+                        compare_slices.append({
+                            "fname": fname,
+                            "summ": summ,
+                            "judge_key": judge_key,
+                            "label": str(judge_key).strip(),
+                            "rows": slice_rows,
+                        })
+
+                nonempty = [s for s in compare_slices if s["rows"]]
+                _disambiguate_compare_slice_labels(nonempty)
+                empty_files = [fn for fn in selected if not _rows_for_single_metric(loaded_cmp[fn], compare_metric_choice)]
+
+                if len(nonempty) < 2:
+                    st.info(
+                        "Need **at least two judge groups** to compare: e.g. two files, or **one multi-judge** file with "
+                        "two or more models (after the metric filter, if condition **B**)."
+                    )
+                    if empty_files:
+                        st.warning(
+                            "No rows after filters: "
+                            + ", ".join(_short_run_tag_from_results_filename(f) for f in empty_files)
+                        )
+                else:
+                    compare_data = []
+                    for s in nonempty:
+                        summ = s["summ"]
+                        rows = s["rows"]
+                        by_item = _group_by_item(rows)
+                        hl_s = metric_repeat_variability_headlines(by_item)
+                        m1 = metric1_per_item_variance(by_item)
+                        m2 = metric2_exact_agreement(by_item)
+                        mean_score = (
+                            sum(sc for scores in by_item.values() for sc in scores)
+                            / sum(len(scores) for scores in by_item.values())
+                            if by_item
+                            else 0
+                        )
                         compare_data.append({
                             "Condition": summ["condition"],
                             "Dataset": summ["dataset_id"],
-                            "Judge": judge,
-                            "File": fname,
-                            "Items": 0,
-                            "Mean score": "—",
-                            "Mean variance": "—",
-                            "Mean within-item SD": "—",
-                            "% zero variance": "—",
-                            "Repeat agreement (exact)": "—",
+                            "Judge": s["label"],
+                            "Items": m1["n_items"],
+                            "Distinct scores / judgments": (
+                                f"{hl_s['n_distinct_scores']} / {hl_s['n_judgments']}"
+                                if hl_s["n_judgments"]
+                                else "—"
+                            ),
+                            "% repeat pairs differ": (
+                                round(hl_s["pct_repeat_pairs_disagree"], 1)
+                                if hl_s["n_repeat_pairs"]
+                                else "—"
+                            ),
+                            "% items any repeat disagree": (
+                                round(hl_s["pct_items_any_repeat_disagree"], 1)
+                                if hl_s["n_items"]
+                                else "—"
+                            ),
+                            "Mean score": round(mean_score, 2),
+                            "Avg spread (pts)": round(m1["mean_within_item_range"], 2),
+                            "Mean variance": round(m1["mean_variance"], 4),
+                            "Median var": round(m1["median_variance"], 4),
+                            "Mean within-item SD": round(m1["mean_within_item_std"], 4),
+                            "% zero variance": round(m1["pct_items_zero_variance"], 1),
+                            "Repeat agreement (exact)": f"{m2['mean_agreement_rate']:.1%}",
                         })
-                        skipped.append(fname)
-                        continue
-                    judge = rows[0].get("judge_model", fname)
-                    by_item = _group_by_item(rows)
-                    m1 = metric1_per_item_variance(by_item)
-                    m2 = metric2_exact_agreement(by_item)
-                    mean_score = sum(s for scores in by_item.values() for s in scores) / sum(len(s) for s in by_item.values()) if by_item else 0
-                    compare_data.append({
-                        "Condition": summ["condition"],
-                        "Dataset": summ["dataset_id"],
-                        "Judge": judge,
-                        "File": fname,
-                        "Items": m1["n_items"],
-                        "Mean score": round(mean_score, 2),
-                        "Mean variance": round(m1["mean_variance"], 4),
-                        "Mean within-item SD": round(m1["mean_within_item_std"], 4),
-                        "% zero variance": round(m1["pct_items_zero_variance"], 1),
-                        "Repeat agreement (exact)": f"{m2['mean_agreement_rate']:.1%}",
-                    })
 
-                if skipped:
-                    st.warning(f"Skipped (empty): {', '.join(skipped)}")
-                if compare_data:
                     st.subheader("Per-judge metrics")
                     st.dataframe(pd.DataFrame(compare_data), use_container_width=True)
                     st.caption(
-                        "**Mean score** is the average of all valid **integer** judgments (items × repeats), so decimals are normal. "
-                        "**Mean within-item SD** is the average of √(per-item variance) — typical spread of repeat scores in **points** on the 0–100 scale. "
-                        "**Repeat agreement (exact)** is separate: fraction of repeat pairs that match exactly, averaged over items."
+                        "**Distinct scores / judgments**, **% repeat pairs differ**, and **% items any repeat disagree** are all **within-item** summaries (not a pooled min/max across all scores). "
+                        "**Judge** is the model id (plus a run tag only if the same model appears twice)."
                     )
 
-                    # Reliability chart: % zero variance (higher = more reliable)
+                    vendor_agg: dict = {}
+                    for s in nonempty:
+                        by_item_v = _group_by_item(s["rows"])
+                        if not by_item_v:
+                            continue
+                        m1v = metric1_per_item_variance(by_item_v)
+                        m2v = metric2_exact_agreement(by_item_v)
+                        vlabel = _api_vendor_label(s["judge_key"])
+                        vendor_agg.setdefault(vlabel, []).append({
+                            "pct_zero": m1v["pct_items_zero_variance"],
+                            "mean_w_std": m1v["mean_within_item_std"],
+                            "mean_var": m1v["mean_variance"],
+                            "agree": m2v["mean_agreement_rate"],
+                            "n_items": m1v["n_items"],
+                        })
+
+                    show_vendors = {k for k in vendor_agg if vendor_agg[k]}
+                    if len(show_vendors) >= 2:
+                        st.subheader("API vendor summary")
+                        st.caption(
+                            "Item-**weighted** averages across judge models in each API bucket (OpenAI vs Anthropic). "
+                            "Higher **% zero variance** and **repeat agreement** indicates more stable repeats here; "
+                            "**lower within-item SD** means tighter repeat spread across K."
+                        )
+                        v_rows = []
+                        for vname in sorted(show_vendors):
+                            parts = vendor_agg[vname]
+                            wtot = sum(p["n_items"] for p in parts)
+                            if wtot <= 0:
+                                continue
+                            w_pct = sum(p["pct_zero"] * p["n_items"] for p in parts) / wtot
+                            w_std = sum(p["mean_w_std"] * p["n_items"] for p in parts) / wtot
+                            w_agr = sum(p["agree"] * p["n_items"] for p in parts) / wtot
+                            w_var = sum(p["mean_var"] * p["n_items"] for p in parts) / wtot
+                            v_rows.append({
+                                "API": vname,
+                                "Models": len(parts),
+                                "Weighted avg % zero variance": round(w_pct, 2),
+                                "Weighted avg within-item SD": round(w_std, 4),
+                                "Weighted avg repeat agreement": round(w_agr, 4),
+                                "Weighted avg mean variance": round(w_var, 4),
+                            })
+                        if v_rows:
+                            st.dataframe(pd.DataFrame(v_rows), use_container_width=True, hide_index=True)
+                            vdf = pd.DataFrame(v_rows)
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                fig_v = px.bar(
+                                    vdf,
+                                    x="API",
+                                    y="Weighted avg % zero variance",
+                                    color="API",
+                                    color_discrete_map={"OpenAI": "#10a37f", "Anthropic": "#d4a574"},
+                                )
+                                fig_v.update_layout(
+                                    yaxis_title="% zero variance (weighted)",
+                                    yaxis=dict(range=[0, 105]),
+                                    showlegend=False,
+                                    height=320,
+                                )
+                                st.plotly_chart(fig_v, use_container_width=True)
+                            with c2:
+                                fig_w = px.bar(
+                                    vdf,
+                                    x="API",
+                                    y="Weighted avg within-item SD",
+                                    color="API",
+                                    color_discrete_map={"OpenAI": "#10a37f", "Anthropic": "#d4a574"},
+                                )
+                                fig_w.update_layout(
+                                    yaxis_title="Within-item SD (lower = tighter repeats)",
+                                    showlegend=False,
+                                    height=320,
+                                )
+                                st.plotly_chart(fig_w, use_container_width=True)
+                    elif len(show_vendors) == 1:
+                        only = next(iter(show_vendors))
+                        st.caption(
+                            f"**Vendor comparison:** only **{only}** judges appear in this selection — add results from "
+                            "the other provider (e.g. use **Run all preset judges**) to compare OpenAI vs Anthropic."
+                        )
+
                     rel_data = [
                         {"judge": r["Judge"], "pct_zero_variance": r["% zero variance"]}
                         for r in compare_data
@@ -842,37 +1131,30 @@ with tab_compare:
                     else:
                         st.info("No reliability data to chart (select files with valid judgments).")
 
-                    # Score spread per item across judges
                     st.subheader("Score spread per item across judges")
                     st.caption(
-                        "Spread = max(score across judges) − min(score across judges). Higher = more disagreement. "
-                        "All compared files must share the same dataset (same item set)."
+                        "Spread = max(mean score across judge groups) − min. Each group is one **`judge_model · file`** slice. "
+                        "Requires the **same set of item_ids** (and same dataset) across all slices."
                     )
-                    file_item_sets = {}
                     spread_by_item: dict = {}
-                    for fname in selected:
-                        if fname in skipped:
-                            continue
-                        path = RESULTS_DIR / fname
-                        rows = load_jsonl(path)
-                        if compare_metric_choice is not None:
-                            rows = [r for r in rows if str(r.get("metric_name")) == str(compare_metric_choice)]
-                        judge = rows[0].get("judge_model", fname.replace("mtbench_judge-", "").split("_K")[0]) if rows else fname
-                        by_item = _group_by_item(rows)
+                    slice_item_sets: list = []
+                    for s in nonempty:
+                        by_item = _group_by_item(s["rows"])
                         item_ids = frozenset(by_item.keys())
-                        file_item_sets[fname] = (len(item_ids), item_ids)
+                        slice_item_sets.append((s["label"], len(item_ids), item_ids))
                         for item_id, scores in by_item.items():
-                            spread_by_item.setdefault(item_id, {})[judge] = sum(scores) / len(scores)
-                    spread_valid = len(file_item_sets) >= 2
+                            spread_by_item.setdefault(item_id, {})[s["label"]] = sum(scores) / len(scores)
+
+                    spread_valid = len(slice_item_sets) >= 2
                     if spread_valid:
-                        ref_count, ref_items = next(iter(file_item_sets.values()))
-                        for fname, (n, items) in file_item_sets.items():
+                        _, ref_count, ref_items = slice_item_sets[0]
+                        for _lbl, n, items in slice_item_sets:
                             if n != ref_count or items != ref_items:
                                 spread_valid = False
                                 break
-                    if not spread_valid or len(file_item_sets) < 2:
+                    if not spread_valid or len(slice_item_sets) < 2:
                         st.warning(
-                            "All compared files must have the same number of items and represent the same dataset (frozen subset). "
+                            "All compared judge groups must share the **same item_ids** (same dataset / design). "
                             "Cannot compute spread across judges."
                         )
                     else:
@@ -887,7 +1169,7 @@ with tab_compare:
                                     "spread": spread,
                                     "min_score": mn,
                                     "max_score": mx,
-                                    "judge_scores": ", ".join(f"{j}: {s:.1f}" for j, s in sorted(judge_scores.items())),
+                                    "judge_scores": ", ".join(f"{j}: {v:.1f}" for j, v in sorted(judge_scores.items())),
                                 })
                         if spread_rows:
                             spread_df = pd.DataFrame(spread_rows).sort_values("spread", ascending=False)
@@ -924,8 +1206,8 @@ with tab_compare:
                             st.plotly_chart(spread_fig, use_container_width=True)
                         else:
                             st.info(
-                                "Need items scored by at least 2 judges. "
-                                "Ensure selected files share common item_ids (e.g. same dataset)."
+                                "Need at least two judge groups with overlapping items. "
+                                "Check **judge_model** splits and shared **item_id**s."
                             )
 
 
@@ -969,7 +1251,8 @@ with tab_run:
         [2, 3, 5, 10],
         index=2,
         key="run_k",
-        help="Each item is judged K times. Total calls scale with K (and with number of metrics under **B**).",
+        help=_help_text("run_k_repeats")
+        or "Each item is judged K times; round-robin order across items. Total calls scale with K (and metrics under **B**).",
     )
     temp_choice = st.number_input(
         "Temperature",
@@ -1004,7 +1287,7 @@ with tab_run:
     )
     metrics_pick_run: list = []
     if condition_name == "metric_rubric":
-        _metric_options = sorted(METRIC_GLOSS_DEFAULTS.keys())
+        _metric_options = list(METRIC_GLOSS_DEFAULTS.keys())
         metrics_pick_run = st.multiselect(
             "Metrics to score",
             options=_metric_options,
@@ -1032,10 +1315,60 @@ with tab_run:
         help=_help_text("run_total_records_formula"),
     )
 
+    run_output_mode = st.radio(
+        "Results output",
+        options=[_RUN_OUTPUT_NEW_JSONL, _RUN_OUTPUT_RESUME_JSONL],
+        format_func=lambda mode: (
+            "New JSONL file (timestamped under results/)"
+            if mode == _RUN_OUTPUT_NEW_JSONL
+            else "Resume partial JSONL (append missing rows)"
+        ),
+        key="run_output_mode_radio",
+        help=_help_text("run_output_mode"),
+    )
+    resume_partial = run_output_mode == _RUN_OUTPUT_RESUME_JSONL
+
+    resume_path_arg: Optional[str] = None
+    jsonl_for_resume: list = []
+    if resume_partial:
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        jsonl_for_resume = sorted(
+            RESULTS_DIR.glob("*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if jsonl_for_resume:
+            labels = [p.name for p in jsonl_for_resume]
+            pick = st.selectbox(
+                "File to resume",
+                options=labels,
+                key="run_resume_select",
+                help=_help_text("run_resume_file_pick"),
+            )
+            st.caption(_help_text("run_resume_partial"))
+            custom_resume = st.text_input(
+                "Or explicit path (optional; overrides dropdown)",
+                value="",
+                key="run_resume_custom_path",
+                help="Absolute path, or a filename under **results/**.",
+            ).strip()
+            if custom_resume:
+                cand = Path(custom_resume)
+                resume_path_arg = str(cand if cand.is_absolute() else (RESULTS_DIR / cand.name))
+            else:
+                resume_path_arg = str((RESULTS_DIR / pick).resolve())
+        else:
+            st.warning("No `.jsonl` files in **results/** yet. Choose **New JSONL file** or add a partial file first.")
+
     st.divider()
     if st.button("Run experiment", type="primary", key="run_btn"):
         if "Full" in dataset_choice and not input_path.exists():
             st.error("mt_bench_full.json not found. Run: python src/build_mt_bench_full.py")
+        elif resume_partial and not jsonl_for_resume:
+            st.error(
+                "**Resume partial JSONL** is selected but **results/** has no `.jsonl` files. "
+                "Switch to **New JSONL file** or add a partial run under **results/**."
+            )
         else:
             metric_names_arg = None
             block_run = False
@@ -1068,6 +1401,8 @@ with tab_run:
                         dataset_id=input_path.stem,
                         progress_callback=_experiment_progress,
                     )
+                    if resume_path_arg:
+                        _run_kw["resume_path"] = resume_path_arg
                     if judge_choice == RUN_ALL_JUDGES_LABEL:
                         result = run_experiment(
                             judge_models=list(JUDGE_MODEL_BATCH_PRESETS),
@@ -1091,9 +1426,14 @@ with tab_run:
                         f"Done. Output: `{out_path}` — **{got_n}** records written "
                         f"(expected **{exp_n}**; counts match)."
                     )
+                    if result.get("resumed"):
+                        st.info(
+                            f"**Resumed** this file: **{result['session_new_rows']}** new rows appended; "
+                            f"**{result['skipped_existing']}** judgment slots were already on disk."
+                        )
                     st.info(
                         f"Tagged **{condition_name}** · dataset **{input_path.stem}** · look for `_cond-{_slug}_` in the "
-                        "filename. On **View Results** / **Compare Judges**, set **Condition** (and **Dataset**) to this run."
+                        "filename. On **View Results** / **Compare judges & vendors**, set **Condition** (and **Dataset**) to this run."
                     )
                     st.session_state[_RUN_RAW_PREVIEW_PATH_KEY] = str(out_path)
                 except Exception as e:

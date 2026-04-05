@@ -1,5 +1,6 @@
 """Compute reliability metrics from judge JSONL output."""
 
+import statistics
 import sys
 from collections import Counter
 from pathlib import Path
@@ -44,27 +45,100 @@ def variance(scores: List[float]) -> float:
 
 
 def metric1_per_item_variance(by_item: Dict[str, List[int]]) -> dict:
-    """Per-item variance, mean variance, % items with zero variance."""
+    """
+    Per-item sample variance (divide by n−1 within each item), then summarize.
+
+    Also reports **mean_within_item_range** = average of (max score − min score) per item on the 0–100
+    scale (with K=2 this equals |Δscore| on that item). Often easier to read than mean variance when
+    one unstable item has a large spread.
+    """
     variances = []
+    ranges: List[float] = []
     zero_var_count = 0
     for item_id, scores in by_item.items():
         var_i = variance(scores)
         variances.append(var_i)
         if var_i == 0:
             zero_var_count += 1
+        if len(scores) >= 2:
+            ranges.append(float(max(scores) - min(scores)))
+        else:
+            ranges.append(0.0)
 
     n_items = len(by_item)
     mean_var = sum(variances) / n_items if n_items else 0
+    median_var = float(statistics.median(variances)) if variances else 0.0
     pct_zero = 100 * zero_var_count / n_items if n_items else 0
     # Average of per-item sample SDs (sqrt of per-item variance); same units as score (0–100).
     mean_within_item_std = sum(sqrt(v) for v in variances) / n_items if n_items else 0.0
+    mean_within_item_range = sum(ranges) / n_items if n_items and ranges else 0.0
+    max_within_item_range = max(ranges) if ranges else 0.0
 
     return {
         "mean_variance": mean_var,
+        "median_variance": median_var,
         "mean_within_item_std": mean_within_item_std,
+        "mean_within_item_range": mean_within_item_range,
+        "max_within_item_range": max_within_item_range,
         "pct_items_zero_variance": pct_zero,
         "n_items": n_items,
         "zero_var_count": zero_var_count,
+    }
+
+
+def metric_repeat_variability_headlines(by_item: Dict[str, List[int]]) -> dict:
+    """
+    Summarize repeat disagreement **within items** (not a pooled min/max across all judgments).
+
+    - **Distinct scores / judgments**: score diversity when pooling rows (still useful churn signal).
+    - **% repeat pairs disagree**: within each item, share of unordered repeat pairs with different scores.
+    - **% items with any disagreeing repeats**: how many items are unstable across K.
+    """
+    all_scores: List[int] = []
+    for scores in by_item.values():
+        all_scores.extend(scores)
+
+    n_j = len(all_scores)
+    if n_j == 0:
+        return {
+            "n_items": len(by_item),
+            "n_judgments": 0,
+            "n_distinct_scores": 0,
+            "n_repeat_pairs": 0,
+            "n_repeat_pairs_disagree": 0,
+            "pct_repeat_pairs_disagree": 0.0,
+            "n_items_any_repeat_disagree": 0,
+            "pct_items_any_repeat_disagree": 0.0,
+        }
+
+    n_unique = len(set(all_scores))
+
+    n_pairs = 0
+    n_disagree_pairs = 0
+    items_disagree = 0
+    for scores in by_item.values():
+        pairs = list(itertools.combinations(scores, 2))
+        if not pairs:
+            continue
+        item_dis = False
+        for a, b in pairs:
+            n_pairs += 1
+            if a != b:
+                n_disagree_pairs += 1
+                item_dis = True
+        if item_dis:
+            items_disagree += 1
+
+    n_items = len(by_item)
+    return {
+        "n_items": n_items,
+        "n_judgments": n_j,
+        "n_distinct_scores": n_unique,
+        "n_repeat_pairs": n_pairs,
+        "n_repeat_pairs_disagree": n_disagree_pairs,
+        "pct_repeat_pairs_disagree": 100.0 * n_disagree_pairs / n_pairs if n_pairs else 0.0,
+        "n_items_any_repeat_disagree": items_disagree,
+        "pct_items_any_repeat_disagree": 100.0 * items_disagree / n_items if n_items else 0.0,
     }
 
 
@@ -223,11 +297,31 @@ def main():
 
     by_item = _group_by_item(rows)
 
+    hl = metric_repeat_variability_headlines(by_item)
+    print("0. REPEAT VARIABILITY (pooled judgments)")
+    print(f"   Distinct scores / judgments:  {hl['n_distinct_scores']} / {hl['n_judgments']}")
+    print(
+        f"   Repeat pairs with different scores: {hl['n_repeat_pairs_disagree']}/{hl['n_repeat_pairs']} "
+        f"({hl['pct_repeat_pairs_disagree']:.1f}%)"
+    )
+    print(
+        f"   Items with any disagreeing repeats: {hl['n_items_any_repeat_disagree']} / {hl['n_items']} "
+        f"({hl['pct_items_any_repeat_disagree']:.1f}%)"
+    )
+    print()
+
     # 1. Per-item variance
     m1 = metric1_per_item_variance(by_item)
     print("1. PER-ITEM VARIANCE")
     print("   Mean variance across items:    {:.4f}".format(m1["mean_variance"]))
+    print("   Median variance across items:  {:.4f}".format(m1["median_variance"]))
     print("   Mean within-item SD (score units): {:.4f}".format(m1["mean_within_item_std"]))
+    print(
+        "   Mean score spread per item (max−min, points): {:.2f} (max item: {:.1f})".format(
+            m1["mean_within_item_range"],
+            m1["max_within_item_range"],
+        )
+    )
     print("   % of items with zero variance: {:.1f}%".format(m1["pct_items_zero_variance"]))
     print(f"   ({m1['zero_var_count']} / {m1['n_items']} items)")
     print()
