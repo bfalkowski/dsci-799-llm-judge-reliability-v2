@@ -5,7 +5,7 @@ import math
 import os
 import re
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
@@ -195,6 +195,36 @@ def _api_vendor_label(judge_key: str) -> str:
 VENDOR_BAR_COLOR_MAP = {"OpenAI": "#10a37f", "Anthropic": "#c4713f"}
 
 
+# Mean-score line chart: teal/emerald family (OpenAI), orange/terracotta (Anthropic); cycle within family.
+_OPENAI_LINE_FAMILY = (
+    "#064e3b",
+    "#047857",
+    "#059669",
+    "#10a37f",
+    "#14b8a6",
+    "#2dd4bf",
+    "#5eead4",
+)
+_ANTHROPIC_LINE_FAMILY = (
+    "#7c2d12",
+    "#9a3412",
+    "#c2410c",
+    "#c4713f",
+    "#ea580c",
+    "#f97316",
+    "#fb923c",
+)
+
+
+def _line_color_vendor_family(vendor: str, within_vendor_index: int) -> str:
+    """Hue family by API; distinct shades per model (cycles if many judges per vendor)."""
+    if vendor == "Anthropic":
+        pal = _ANTHROPIC_LINE_FAMILY
+    else:
+        pal = _OPENAI_LINE_FAMILY
+    return pal[within_vendor_index % len(pal)]
+
+
 def _first_execution_id(rows: list) -> str:
     if not rows:
         return "—"
@@ -346,6 +376,62 @@ def _run_summary_rel_row(
         "Mean within-item SD": round(m1["mean_within_item_std"], 4),
         "Repeat agreement (exact)": round(m2["mean_agreement_rate"] * 100.0, 2),
     }
+
+
+def _pct_zero_variance_for_pool(by_item: dict) -> Optional[float]:
+    if not by_item:
+        return None
+    m1 = metric1_per_item_variance(by_item)
+    if not m1.get("n_items"):
+        return None
+    return float(m1["pct_items_zero_variance"])
+
+
+def _composite_pct_zero_equal_abc(
+    pool: dict,
+    fname_to_condition: dict,
+) -> Tuple[Optional[float], dict]:
+    """
+    Repeat stability with equal weight per condition: B = mean of per-metric % zero variance;
+    composite = mean of A, aggregated B, and C among conditions present in the selection.
+    """
+    pool_a: dict = {}
+    pool_c: dict = {}
+    pools_b_by_m = defaultdict(dict)
+    for k, scores in pool.items():
+        parts = k.split("\t")
+        if not parts:
+            continue
+        fname = parts[0]
+        cond = fname_to_condition.get(fname)
+        if not cond:
+            continue
+        if cond == "generic_overall" and len(parts) == 2:
+            pool_a[k] = scores
+        elif cond == "per_item_custom" and len(parts) == 2:
+            pool_c[k] = scores
+        elif cond == "metric_rubric" and len(parts) == 3:
+            mname = parts[1]
+            pools_b_by_m[mname][k] = scores
+    pct_a = _pct_zero_variance_for_pool(pool_a)
+    pct_c = _pct_zero_variance_for_pool(pool_c)
+    b_by_metric: dict = {}
+    b_vals = []
+    for mname in sorted(pools_b_by_m.keys()):
+        pv = _pct_zero_variance_for_pool(pools_b_by_m[mname])
+        b_by_metric[mname] = pv
+        if pv is not None:
+            b_vals.append(pv)
+    pct_b = sum(b_vals) / len(b_vals) if b_vals else None
+    present = [x for x in (pct_a, pct_b, pct_c) if x is not None]
+    comp = sum(present) / len(present) if present else None
+    detail = {
+        "A": pct_a,
+        "B_mean": pct_b,
+        "C": pct_c,
+        "B_by_metric": b_by_metric,
+    }
+    return comp, detail
 
 
 def _rel_econ_economics_for_judge(
@@ -514,6 +600,266 @@ def _rel_econ_style_single_hbar(
         if x_range is not None:
             kw["range"] = list(x_range)
         fig.update_xaxes(**kw)
+
+
+def _rel_econ_condition_weighted_stability_chart(
+    rel_econ_combined_df: pd.DataFrame,
+    pooled_by_judge: dict,
+    fname_to_condition: dict,
+) -> None:
+    """Horizontal bars: % zero variance with A, B (mean of metrics), C each counting once."""
+
+    def _fmt_pct(x):
+        if x is None:
+            return "—"
+        return f"{float(x):.1f}%"
+
+    cdf = rel_econ_combined_df.copy()
+    cdf["_usd_only"] = _rel_econ_unified_spend_series(cdf)
+    has_usd = (cdf["_usd_only"].notna() & (cdf["_usd_only"] > 0)).any()
+    cdf["_sort_key"] = cdf["_usd_only"] if has_usd else pd.to_numeric(cdf["JSONL tokens (sum)"], errors="coerce")
+    cdf_plot = cdf.sort_values("_sort_key", ascending=True, na_position="first")
+    judges = cdf_plot["Judge"].astype(str).tolist()
+    vlist = cdf_plot["Vendor"].astype(str).tolist()
+    bar_colors = [VENDOR_BAR_COLOR_MAP.get(v, "#6366f1") for v in vlist]
+    n = len(judges)
+    if n == 0:
+        return
+
+    pairs = []
+    for j in judges:
+        pool = pooled_by_judge.get(j, {})
+        comp, det = _composite_pct_zero_equal_abc(pool, fname_to_condition)
+        pairs.append((comp, det))
+
+    if all(p[0] is None for p in pairs):
+        st.info(
+            "No **condition-weighted** repeat stability to show yet (need scored repeat data for judges in the selection)."
+        )
+        return
+
+    st.subheader("Repeat stability — equal weight per condition (A, B, C)")
+    st.caption(
+        "**Condition B** is **one** score: the **mean** of **% zero variance** over **each metric’s** pool. **A** and **C** "
+        "each use one pooled score. The **composite** averages those **condition-level** scores (only conditions present "
+        "in your selected JSONLs)."
+    )
+
+    x_vals = []
+    labels = []
+    customdata = []
+    for comp, det in pairs:
+        if comp is not None:
+            x_vals.append(float(comp))
+            labels.append(f"{float(comp):.1f}%")
+        else:
+            x_vals.append(0.0)
+            labels.append("—")
+        bb = det.get("B_by_metric") or {}
+        bb_s = ", ".join(f"{mk}: {_fmt_pct(bb[mk])}" for mk in sorted(bb.keys()))
+        customdata.append(
+            (
+                _fmt_pct(det.get("A")),
+                _fmt_pct(det.get("B_mean")),
+                _fmt_pct(det.get("C")),
+                bb_s,
+            )
+        )
+
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                y=judges,
+                x=x_vals,
+                orientation="h",
+                marker_color=bar_colors,
+                text=labels,
+                textposition="outside",
+                cliponaxis=False,
+                customdata=customdata,
+                hovertemplate=(
+                    "<b>%{y}</b><br>Composite: %{x:.2f}%<br>A: %{customdata[0]}<br>B (mean of metrics): %{customdata[1]}<br>"
+                    "C: %{customdata[2]}<br>B by metric: %{customdata[3]}<extra></extra>"
+                ),
+                showlegend=False,
+            )
+        ]
+    )
+    lm = _rel_econ_left_margin_for_labels(judges)
+    _rel_econ_style_single_hbar(
+        fig,
+        margin_l=lm,
+        n_judges=n,
+        x_title="% zero variance (composite, condition-weighted)",
+        use_log_x=False,
+        log_vals=None,
+        x_range=(0, 100),
+    )
+    _tok_sum = int(pd.to_numeric(cdf["JSONL tokens (sum)"], errors="coerce").fillna(0).sum())
+    _oai_ex = pd.to_numeric(
+        cdf.get("Export $ OpenAI (line items)", pd.Series(dtype=float)), errors="coerce"
+    ).fillna(0)
+    _ant_ex = pd.to_numeric(
+        cdf.get("Export cost USD (Anthropic)", pd.Series(dtype=float)), errors="coerce"
+    ).fillna(0)
+    _key_suf = f"{n}_{_tok_sum}_{int(_oai_ex.sum()*100)}_{int(_ant_ex.sum()*100)}"
+    with st.container(border=True):
+        st.markdown("##### % zero variance — A, B (mean of metrics), C each count once")
+        st.plotly_chart(fig, use_container_width=True, key=f"rel_econ_condabc_{_key_suf}")
+
+
+def _short_metric_label(m: str, max_len: int = 36) -> str:
+    s = str(m).strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
+
+
+def _rel_econ_mean_score_line_by_condition(
+    reliability_rows: list,
+    rel_econ_combined_df: pd.DataFrame,
+) -> None:
+    """Line chart: x = A, each B metric, C; y = mean score; one trace per judge (same order as combined table)."""
+    if not reliability_rows:
+        return
+    parsed = []
+    for rr in reliability_rows:
+        try:
+            ms = rr.get("Mean score")
+            if ms is None:
+                continue
+            judge = str(rr.get("Judge") or "").strip()
+            if not judge:
+                continue
+            parsed.append({
+                "judge": judge,
+                "condition": str(rr.get("Condition") or ""),
+                "metric": rr.get("Metric"),
+                "mean_score": float(ms),
+            })
+        except (TypeError, ValueError):
+            continue
+    if not parsed:
+        return
+
+    metrics_b = sorted(
+        {
+            str(r["metric"])
+            for r in parsed
+            if r["condition"] == "metric_rubric"
+            and r["metric"] is not None
+            and str(r["metric"]).strip() not in ("", "—")
+        }
+    )
+    x_labels = (
+        ["A — generic overall"]
+        + [f"B — {_short_metric_label(m)}" for m in metrics_b]
+        + ["C — per-item custom"]
+    )
+
+    cdf = rel_econ_combined_df.copy()
+    cdf["_usd_only"] = _rel_econ_unified_spend_series(cdf)
+    has_usd = (cdf["_usd_only"].notna() & (cdf["_usd_only"] > 0)).any()
+    cdf["_sort_key"] = cdf["_usd_only"] if has_usd else pd.to_numeric(cdf["JSONL tokens (sum)"], errors="coerce")
+    judges_order = cdf.sort_values("_sort_key", ascending=True, na_position="first")["Judge"].astype(str).tolist()
+
+    def _avg(vals: list) -> Optional[float]:
+        return sum(vals) / len(vals) if vals else None
+
+    fig = go.Figure()
+    n_traces = 0
+    oai_line_i = 0
+    ant_line_i = 0
+    for judge in judges_order:
+        y_pts: list = []
+        va = [
+            r["mean_score"]
+            for r in parsed
+            if r["judge"] == judge and r["condition"] == "generic_overall"
+        ]
+        y_pts.append(_avg(va))
+        for m in metrics_b:
+            vb = [
+                r["mean_score"]
+                for r in parsed
+                if r["judge"] == judge
+                and r["condition"] == "metric_rubric"
+                and str(r["metric"]) == m
+            ]
+            y_pts.append(_avg(vb))
+        vc = [
+            r["mean_score"]
+            for r in parsed
+            if r["judge"] == judge and r["condition"] == "per_item_custom"
+        ]
+        y_pts.append(_avg(vc))
+        if all(v is None for v in y_pts):
+            continue
+        _vendor = _api_vendor_label(judge)
+        if _vendor == "Anthropic":
+            color = _line_color_vendor_family(_vendor, ant_line_i)
+            ant_line_i += 1
+        else:
+            color = _line_color_vendor_family(_vendor, oai_line_i)
+            oai_line_i += 1
+        y_plot = [float(v) if v is not None else None for v in y_pts]
+        fig.add_trace(
+            go.Scatter(
+                x=x_labels,
+                y=y_plot,
+                mode="lines+markers",
+                name=judge,
+                line=dict(color=color, width=2),
+                marker=dict(size=9, color=color),
+                connectgaps=False,
+                hovertemplate=(
+                    "<b>%{fullData.name}</b><br>%{x}<br>Mean score: %{y:.2f}<extra></extra>"
+                ),
+            )
+        )
+        n_traces += 1
+
+    if n_traces == 0:
+        st.info("No **mean score** rows to draw condition lines (check scored JSONLs).")
+        return
+
+    fig.update_layout(
+        title=dict(text="", font=dict(size=1)),
+        xaxis_title="Condition / B metric",
+        yaxis_title="Mean score",
+        yaxis=dict(range=[50, 100], showgrid=True, gridcolor="rgba(0,0,0,0.08)"),
+        xaxis=dict(tickangle=-28, showgrid=False),
+        height=480,
+        margin=dict(l=56, r=24, t=28, b=140),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.32,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=11),
+        ),
+        hovermode="x unified",
+    )
+    _tok_sum = int(pd.to_numeric(cdf["JSONL tokens (sum)"], errors="coerce").fillna(0).sum())
+    _oai_ex = pd.to_numeric(
+        cdf.get("Export $ OpenAI (line items)", pd.Series(dtype=float)), errors="coerce"
+    ).fillna(0)
+    _ant_ex = pd.to_numeric(
+        cdf.get("Export cost USD (Anthropic)", pd.Series(dtype=float)), errors="coerce"
+    ).fillna(0)
+    _key_suf = f"{n_traces}_{len(x_labels)}_{_tok_sum}_{int(_oai_ex.sum()*100)}_{int(_ant_ex.sum()*100)}"
+
+    st.subheader("Mean score across conditions (all judges)")
+    st.caption(
+        "One **line** per **judge_model**, same order as economics rows (by spend / tokens). **A** and **C** are the "
+        "overall **mean score** for that condition (averaged across files if you picked several). **B** adds one point "
+        "**per metric_name**. Missing points break the line (no score for that slice). **OpenAI** judges use **teal / "
+        "emerald** shades (each model a different step); **Anthropic** judges use **orange / terracotta** the same way. "
+        "**Y-axis is 50–100** to spread out typical judge means; values under 50 are clipped (hover still shows the real score)."
+    )
+    with st.container(border=True):
+        st.plotly_chart(fig, use_container_width=True, key=f"rel_econ_meanline_{_key_suf}")
 
 
 def _rel_econ_combined_charts(rel_econ_combined_df: pd.DataFrame) -> None:
@@ -2423,12 +2769,14 @@ with tab_run_summary:
             reliability_rows: list = []
             pooled_by_judge: dict = {}
             conditions_seen: set = set()
+            fname_to_condition: dict = {}
             total_in = total_out = 0
 
             for fname in selected_names:
                 path = RESULTS_DIR / fname
                 rows = load_jsonl(path)
                 summ = _summarize_result_file(path)
+                fname_to_condition[fname] = summ["condition"]
                 conditions_seen.add(str(summ["condition"]))
                 pmean = _mean_panel_score(rows)
                 tag = _short_run_tag_from_results_filename(fname)
@@ -2594,6 +2942,12 @@ with tab_run_summary:
                 rel_econ_combined_df = pd.DataFrame(rel_econ_combined_rows)
                 st.dataframe(rel_econ_combined_df, use_container_width=True, hide_index=True)
                 _rel_econ_combined_charts(rel_econ_combined_df)
+                _rel_econ_condition_weighted_stability_chart(
+                    rel_econ_combined_df,
+                    pooled_by_judge,
+                    fname_to_condition,
+                )
+                _rel_econ_mean_score_line_by_condition(reliability_rows, rel_econ_combined_df)
 
             if reliability_rows:
                 with st.expander("Per file detail (judge × file × metric)", expanded=False):
