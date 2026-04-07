@@ -1,19 +1,21 @@
 """Streamlit dashboard for LLM-as-a-judge reliability experiments."""
 
 import json
+import math
 import os
 import re
 import sys
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from dotenv import load_dotenv
 
 import altair as alt
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 # Allow importing from src when dashboard runs from repo root
@@ -27,6 +29,7 @@ from run_repeated_judging import (
     load_judge_prompt,
     run_experiment,
 )
+from vendor_billing_csv import parse_uploaded_files
 from compute_metrics import (
     _group_by_item,
     metric1_per_item_variance,
@@ -188,6 +191,712 @@ def _api_vendor_label(judge_key: str) -> str:
     return "OpenAI"
 
 
+# Bar colors for OpenAI vs Anthropic (match across Run summary, Compare, etc.)
+VENDOR_BAR_COLOR_MAP = {"OpenAI": "#10a37f", "Anthropic": "#c4713f"}
+
+
+def _first_execution_id(rows: list) -> str:
+    if not rows:
+        return "—"
+    eid = str(rows[0].get("execution_id") or "").strip()
+    return eid if eid else "—"
+
+
+def _mean_panel_score(rows: list) -> Optional[float]:
+    """Mean of each judge's mean score (non-null rows only); judges weighted equally."""
+    judges = _unique_judge_models_in_rows(rows)
+    if not judges:
+        return None
+    jmeans: list = []
+    for j in judges:
+        part = _rows_for_judge_model(rows, j)
+        scores = [float(r["score"]) for r in part if r.get("score") is not None]
+        if scores:
+            jmeans.append(sum(scores) / len(scores))
+    if not jmeans:
+        return None
+    return sum(jmeans) / len(jmeans)
+
+
+def _token_totals_by_judge(rows: list) -> dict:
+    """Aggregate input/output tokens per judge_model (missing tokens → 0)."""
+    out: dict = {}
+    for r in rows:
+        j = str(r.get("judge_model") or "").strip()
+        if not j:
+            continue
+        inn = int(r.get("input_tokens") or 0)
+        ott = int(r.get("output_tokens") or 0)
+        if j not in out:
+            out[j] = {"in": 0, "out": 0}
+        out[j]["in"] += inn
+        out[j]["out"] += ott
+    return out
+
+
+def _estimate_vendor_cost_us1m(tin: float, tout: float, rate_in: float, rate_out: float) -> float:
+    return (tin / 1_000_000.0) * rate_in + (tout / 1_000_000.0) * rate_out
+
+
+def _effective_rates_for_judge(
+    judge: str,
+    vendor: str,
+    rate_oai_in: float,
+    rate_oai_out: float,
+    rate_ant_in: float,
+    rate_ant_out: float,
+    rate_overrides: Optional[dict],
+) -> Tuple[float, float, bool]:
+    """Resolve input/output USD-per-1M rates: per-judge overrides else vendor defaults."""
+    if vendor == "Anthropic":
+        vin, vout = float(rate_ant_in), float(rate_ant_out)
+    else:
+        vin, vout = float(rate_oai_in), float(rate_oai_out)
+    o = (rate_overrides or {}).get(judge)
+    if not isinstance(o, dict):
+        o = {}
+    rin = o.get("in")
+    rout = o.get("out")
+    eff_in = float(rin) if rin is not None else vin
+    eff_out = float(rout) if rout is not None else vout
+    return eff_in, eff_out, bool(eff_in or eff_out)
+
+
+def _openai_export_key_for_judge(judge: str, openai_by_model: dict) -> Optional[str]:
+    """Map JSONL judge id to OpenAI usage CSV model id (often with date suffix)."""
+    if not judge or not openai_by_model:
+        return None
+    j = judge.strip().lower()
+    for k in openai_by_model:
+        kl = k.lower()
+        if kl == j or kl.startswith(j + "-") or kl.startswith(j + "_"):
+            return k
+    for k in openai_by_model:
+        if j in k.lower():
+            return k
+    return None
+
+
+def _anthropic_export_cost_usd(judge: str, cost_by_disp: dict) -> Optional[float]:
+    """Match JSONL claude-* id to Anthropic cost CSV display names."""
+    if not judge or not cost_by_disp:
+        return None
+    j = judge.lower()
+    total = 0.0
+    matched = False
+    for disp, val in cost_by_disp.items():
+        dl = disp.lower()
+        ok = False
+        if "haiku" in j and "haiku" in dl:
+            ok = True
+        elif "opus" in j and "opus" in dl:
+            ok = True
+        elif "sonnet" in j and "4.6" in j and "sonnet" in dl and "4.6" in dl:
+            ok = True
+        elif "sonnet" in j and "4.6" not in j and "sonnet" in dl and "4.6" not in dl:
+            ok = True
+        if ok:
+            total += float(val)
+            matched = True
+    return total if matched else None
+
+
+def _run_summary_rel_row(
+    file_tag: str,
+    summ: dict,
+    judge: str,
+    metric_label: str,
+    by_item: dict,
+) -> dict:
+    if not by_item:
+        return {
+            "File tag": file_tag,
+            "Condition": summ["condition"],
+            "Judge": judge,
+            "Metric": metric_label,
+            "Items": 0,
+            "Mean score": None,
+            "% repeat pairs differ": None,
+            "% items any repeat disagree": None,
+            "% zero variance": None,
+            "Mean within-item SD": None,
+            "Repeat agreement (exact)": None,
+        }
+    hl = metric_repeat_variability_headlines(by_item)
+    m1 = metric1_per_item_variance(by_item)
+    m2 = metric2_exact_agreement(by_item)
+    mean_score = (
+        sum(sc for scores in by_item.values() for sc in scores)
+        / sum(len(scores) for scores in by_item.values())
+    )
+    return {
+        "File tag": file_tag,
+        "Condition": summ["condition"],
+        "Judge": judge,
+        "Metric": metric_label,
+        "Items": m1["n_items"],
+        "Mean score": round(mean_score, 2),
+        "% repeat pairs differ": (
+            round(hl["pct_repeat_pairs_disagree"], 1) if hl["n_repeat_pairs"] else None
+        ),
+        "% items any repeat disagree": (
+            round(hl["pct_items_any_repeat_disagree"], 1) if hl["n_items"] else None
+        ),
+        "% zero variance": round(m1["pct_items_zero_variance"], 2),
+        "Mean within-item SD": round(m1["mean_within_item_std"], 4),
+        "Repeat agreement (exact)": round(m2["mean_agreement_rate"] * 100.0, 2),
+    }
+
+
+def _rel_econ_economics_for_judge(
+    judge: str,
+    pr: dict,
+    rate_oai_in: float,
+    rate_oai_out: float,
+    rate_ant_in: float,
+    rate_ant_out: float,
+    billing_parsed,
+    rate_overrides: Optional[dict] = None,
+) -> dict:
+    """Token totals + estimated / export USD columns for Reliability × economics."""
+    vendor = _api_vendor_label(judge)
+    eff_in, eff_out, has_rate = _effective_rates_for_judge(
+        judge,
+        vendor,
+        rate_oai_in,
+        rate_oai_out,
+        rate_ant_in,
+        rate_ant_out,
+        rate_overrides,
+    )
+    est = _estimate_vendor_cost_us1m(float(pr["in"]), float(pr["out"]), eff_in, eff_out)
+    ex_in = ex_out = None
+    ex_cost_usd = None
+    ex_oai_line_usd = None
+    if billing_parsed:
+        if vendor == "OpenAI" and billing_parsed.openai_by_model:
+            ok = _openai_export_key_for_judge(judge, billing_parsed.openai_by_model)
+            if ok:
+                v = billing_parsed.openai_by_model[ok]
+                ex_in = v["input"]
+                ex_out = v["output"]
+        if vendor == "OpenAI" and billing_parsed.openai_line_cost_by_model:
+            okey = _openai_export_key_for_judge(
+                judge, billing_parsed.openai_line_cost_by_model
+            )
+            if okey:
+                ex_oai_line_usd = float(billing_parsed.openai_line_cost_by_model[okey])
+        if vendor == "Anthropic":
+            if (
+                billing_parsed.anthropic_tokens_by_model
+                and judge in billing_parsed.anthropic_tokens_by_model
+            ):
+                t = billing_parsed.anthropic_tokens_by_model[judge]
+                ex_in = t["in"]
+                ex_out = t["out"]
+            if billing_parsed.anthropic_cost_by_model:
+                ex_cost_usd = _anthropic_export_cost_usd(
+                    judge, billing_parsed.anthropic_cost_by_model
+                )
+    tok_sum = int(pr["in"]) + int(pr["out"])
+    return {
+        "Vendor": vendor,
+        "JSONL input": pr["in"],
+        "JSONL output": pr["out"],
+        "JSONL tokens (sum)": tok_sum,
+        "Est. USD (rates)": round(est, 4) if has_rate else None,
+        "Export input": ex_in,
+        "Export output": ex_out,
+        "Export $ OpenAI (line items)": round(ex_oai_line_usd, 4)
+        if ex_oai_line_usd is not None
+        else None,
+        "Export cost USD (Anthropic)": round(ex_cost_usd, 4)
+        if ex_cost_usd is not None
+        else None,
+    }
+
+
+def _rel_econ_unified_spend_series(df: pd.DataFrame) -> pd.Series:
+    """One USD column for charts: Anthropic export, else OpenAI line items, else estimated rates."""
+    cols_try = (
+        "Export cost USD (Anthropic)",
+        "Export $ OpenAI (line items)",
+        "Est. USD (rates)",
+    )
+
+    def pick(row):
+        for c in cols_try:
+            if c not in df.columns:
+                continue
+            v = row.get(c)
+            if v is not None and pd.notna(v) and float(v) > 0:
+                return float(v)
+        return float("nan")
+
+    return df.apply(pick, axis=1)
+
+
+def _rel_econ_log_scale_ok(vals: list) -> bool:
+    s = [float(x) for x in vals if x is not None and pd.notna(x) and float(x) > 0]
+    if len(s) < 2:
+        return False
+    return (max(s) / min(s)) > 12.0
+
+
+def _rel_econ_log_decade_ticks(vals: list) -> Optional[list]:
+    """Powers of ten from floor(log10 min) through ceil(log10 max) — no minor 2,3,4… labels."""
+    pos = [float(x) for x in vals if x is not None and pd.notna(x) and float(x) > 0]
+    if not pos:
+        return None
+    lo, hi = min(pos), max(pos)
+    e0 = int(math.floor(math.log10(lo)))
+    e1 = int(math.ceil(math.log10(hi)))
+    if e1 < e0:
+        e0, e1 = e1, e0
+    return [10**e for e in range(e0, e1 + 1)]
+
+
+def _rel_econ_left_margin_for_labels(judges: list) -> int:
+    _jmax = max((len(str(j)) for j in judges), default=12)
+    # ~7.5px/char at 14px proportional font + tick/pad; prior 11*+96 was overly wide.
+    return max(128, min(420, (15 * _jmax) // 2 + 54))
+
+
+def _rel_econ_style_single_hbar(
+    fig: go.Figure,
+    *,
+    margin_l: int,
+    n_judges: int,
+    x_title: str,
+    use_log_x: bool,
+    log_vals: Optional[list],
+    x_range: Optional[tuple] = None,
+) -> None:
+    """One horizontal-bar panel: tight gap below ticks; optional log x (tokens only when needed)."""
+    fig.update_yaxes(
+        autorange="reversed",
+        ticklabelposition="outside",
+        ticks="outside",
+        ticklen=3,
+        tickfont=dict(size=14, color="#111"),
+        ticklabelstandoff=4,
+        side="left",
+        automargin=False,
+    )
+    fig.update_layout(
+        height=max(200, 28 * n_judges + 72),
+        margin=dict(l=margin_l, r=28, t=8, b=48),
+        bargap=0.14,
+        showlegend=False,
+    )
+    x_common = dict(
+        title=dict(text=x_title),
+        title_standoff=12,
+        tickfont=dict(size=12, color="#222"),
+        ticklabelstandoff=6,
+        showline=True,
+        linewidth=1,
+        linecolor="#333",
+        showgrid=True,
+        gridcolor="rgba(0,0,0,0.08)",
+        zeroline=False,
+    )
+    if use_log_x and log_vals is not None:
+        ticks = _rel_econ_log_decade_ticks(log_vals)
+        kw = dict(type="log", minor=dict(showgrid=False), **x_common)
+        if ticks:
+            kw["tickmode"] = "array"
+            kw["tickvals"] = ticks
+            kw["ticktext"] = [f"{t:g}" for t in ticks]
+        fig.update_xaxes(**kw)
+    else:
+        kw = dict(type="linear", **x_common)
+        if x_range is not None:
+            kw["range"] = list(x_range)
+        fig.update_xaxes(**kw)
+
+
+def _rel_econ_combined_charts(rel_econ_combined_df: pd.DataFrame) -> None:
+    """Aligned horizontal bars: when USD exists → cost, tokens, $/1M tokens, repeat stability; else tokens + stability."""
+    cdf = rel_econ_combined_df.copy()
+    cdf["_usd_only"] = _rel_econ_unified_spend_series(cdf)
+    has_usd = (cdf["_usd_only"].notna() & (cdf["_usd_only"] > 0)).any()
+    cdf["_sort_key"] = cdf["_usd_only"] if has_usd else pd.to_numeric(cdf["JSONL tokens (sum)"], errors="coerce")
+    _zv = pd.to_numeric(cdf["% zero variance"], errors="coerce")
+    has_var = bool(_zv.notna().any())
+    n = len(cdf)
+    if n == 0:
+        return
+
+    st.subheader("Economics & reliability (charts)")
+    if has_usd:
+        if has_var:
+            st.caption(
+                "Same **judge** order in every panel (highest **total spend** at the top). **Spend** and **USD / 1M tokens** "
+                "use **linear** scales so cost differences read naturally. **Token** counts may use a **log** x-axis only "
+                "when spreads are wide; exact values stay **on the bars**. **% zero variance** is share of items with "
+                "identical repeat scores (higher ⇒ more stable repeats)."
+            )
+        else:
+            st.caption(
+                "Same **judge** order in every panel. **Spend** and **USD / 1M tokens** are **linear**; **tokens** may use "
+                "**log** when spreads are wide. **(4)** No pooled **% zero variance** when nothing is scored for repeats."
+            )
+    elif has_var:
+        st.caption(
+            "Bars share the same **judge** order. **Top:** **JSONL tokens** (no USD column in this view). "
+            "**Bottom:** **% zero variance** (repeat stability)."
+        )
+    else:
+        st.caption(
+            "**JSONL tokens** only — no USD and no reliability column in this view."
+        )
+
+    cdf_plot = cdf.sort_values("_sort_key", ascending=True, na_position="first")
+    judges = cdf_plot["Judge"].astype(str).tolist()
+    vendors = cdf_plot["Vendor"].astype(str).tolist()
+    bar_colors = [VENDOR_BAR_COLOR_MAP.get(v, "#6366f1") for v in vendors]
+
+    usd_vals = [float(x) if x is not None and pd.notna(x) else float("nan") for x in cdf_plot["_usd_only"].tolist()]
+    tok_vals = [float(x or 0) for x in cdf_plot["JSONL tokens (sum)"].tolist()]
+    var_vals = cdf_plot["% zero variance"].tolist()
+    agree_vals = cdf_plot["Repeat agreement (exact)"].tolist() if "Repeat agreement (exact)" in cdf_plot.columns else [None] * n
+
+    var_txt = [
+        (f"{float(v):.1f}%" if v is not None and pd.notna(v) else "") for v in var_vals
+    ]
+
+    per_m_vals: list = []
+    for u, t in zip(usd_vals, tok_vals):
+        if pd.notna(u) and float(u) > 0 and t > 0:
+            per_m_vals.append(float(u) / (t / 1_000_000.0))
+        else:
+            per_m_vals.append(float("nan"))
+    per_m_txt = []
+    for x in per_m_vals:
+        if x is not None and pd.notna(x) and float(x) > 0:
+            per_m_txt.append(f"${float(x):.2f}")
+        else:
+            per_m_txt.append("—")
+
+    tok_txt = []
+    for t in tok_vals:
+        if t > 0:
+            tok_txt.append(f"{int(round(t)):,}")
+        else:
+            tok_txt.append("—")
+
+    usd_txt = []
+    for u in usd_vals:
+        if u is not None and pd.notna(u) and float(u) > 0:
+            usd_txt.append(f"${float(u):.2f}")
+        else:
+            usd_txt.append("—")
+
+    _oai_ex = pd.to_numeric(
+        cdf.get("Export $ OpenAI (line items)", pd.Series(dtype=float)), errors="coerce"
+    ).fillna(0)
+    _ant_ex = pd.to_numeric(
+        cdf.get("Export cost USD (Anthropic)", pd.Series(dtype=float)), errors="coerce"
+    ).fillna(0)
+    _tok_sum = int(pd.to_numeric(cdf["JSONL tokens (sum)"], errors="coerce").fillna(0).sum())
+    _chart_key = (
+        f"rel_econ_{has_usd}_{has_var}_{n}_{_tok_sum}_{int(_oai_ex.sum()*100)}_{int(_ant_ex.sum()*100)}"
+    )
+    lm = _rel_econ_left_margin_for_labels(judges)
+
+    if has_usd:
+        log_tok = _rel_econ_log_scale_ok(tok_vals)
+        tok_x_title = "JSONL tokens, log scale" if log_tok else "JSONL tokens (sum)"
+
+        fig_usd = go.Figure(
+            data=[
+                go.Bar(
+                    y=judges,
+                    x=usd_vals,
+                    orientation="h",
+                    marker_color=bar_colors,
+                    text=usd_txt,
+                    textposition="outside",
+                    cliponaxis=False,
+                    hovertemplate=(
+                        "<b>%{y}</b><br>USD: %{customdata[0]:.4f}<br>Tokens: %{customdata[1]:,.0f}<extra></extra>"
+                    ),
+                    customdata=list(zip(usd_vals, tok_vals)),
+                    showlegend=False,
+                )
+            ]
+        )
+        _rel_econ_style_single_hbar(
+            fig_usd,
+            margin_l=lm,
+            n_judges=n,
+            x_title="Total spend (US$)",
+            use_log_x=False,
+            log_vals=None,
+        )
+
+        fig_tok = go.Figure(
+            data=[
+                go.Bar(
+                    y=judges,
+                    x=tok_vals,
+                    orientation="h",
+                    marker_color=bar_colors,
+                    text=tok_txt,
+                    textposition="outside",
+                    cliponaxis=False,
+                    hovertemplate=(
+                        "<b>%{y}</b><br>Tokens: %{x:,.0f}<br>USD: %{customdata[0]:.4f}<extra></extra>"
+                    ),
+                    customdata=[(u if pd.notna(u) else 0.0) for u in usd_vals],
+                    showlegend=False,
+                )
+            ]
+        )
+        _rel_econ_style_single_hbar(
+            fig_tok,
+            margin_l=lm,
+            n_judges=n,
+            x_title=tok_x_title,
+            use_log_x=log_tok,
+            log_vals=tok_vals if log_tok else None,
+        )
+
+        fig_pm = go.Figure(
+            data=[
+                go.Bar(
+                    y=judges,
+                    x=per_m_vals,
+                    orientation="h",
+                    marker_color=bar_colors,
+                    text=per_m_txt,
+                    textposition="outside",
+                    cliponaxis=False,
+                    hovertemplate=(
+                        "<b>%{y}</b><br>USD / 1M tokens: %{x:.4f}<br>Total tokens: %{customdata[0]:,.0f}<br>"
+                        "% zero variance: %{customdata[1]}<br>Repeat agreement: %{customdata[2]}<extra></extra>"
+                    ),
+                    customdata=list(
+                        zip(
+                            tok_vals,
+                            [
+                                f"{float(v):.2f}%"
+                                if v is not None and pd.notna(v)
+                                else "—"
+                                for v in var_vals
+                            ],
+                            [
+                                f"{float(a):.1f}%"
+                                if a is not None and pd.notna(a)
+                                else "—"
+                                for a in agree_vals
+                            ],
+                        )
+                    ),
+                    showlegend=False,
+                )
+            ]
+        )
+        _rel_econ_style_single_hbar(
+            fig_pm,
+            margin_l=lm,
+            n_judges=n,
+            x_title="US$ per 1M tokens",
+            use_log_x=False,
+            log_vals=None,
+        )
+
+        if has_var:
+            fig_var = go.Figure(
+                data=[
+                    go.Bar(
+                        y=judges,
+                        x=var_vals,
+                        orientation="h",
+                        marker_color=bar_colors,
+                        text=var_txt,
+                        textposition="outside",
+                        cliponaxis=False,
+                        hovertemplate=(
+                            "<b>%{y}</b><br>% zero variance: %{x:.2f}<br>Repeat agree.: %{customdata[0]}<extra></extra>"
+                        ),
+                        customdata=[
+                            (
+                                f"{float(a):.1f}%"
+                                if a is not None and pd.notna(a)
+                                else "—"
+                            )
+                            for a in agree_vals
+                        ],
+                        showlegend=False,
+                    )
+                ]
+            )
+            _rel_econ_style_single_hbar(
+                fig_var,
+                margin_l=lm,
+                n_judges=n,
+                x_title="% of items with zero variance (0–100)",
+                use_log_x=False,
+                log_vals=None,
+                x_range=(0, 100),
+            )
+        else:
+            fig_var = go.Figure(
+                data=[
+                    go.Bar(
+                        y=judges,
+                        x=[0.5] * len(judges),
+                        orientation="h",
+                        marker=dict(color="rgba(160,160,160,0.25)"),
+                        showlegend=False,
+                        hoverinfo="skip",
+                    )
+                ]
+            )
+            _rel_econ_style_single_hbar(
+                fig_var,
+                margin_l=lm,
+                n_judges=n,
+                x_title="Pooled % zero variance (unavailable)",
+                use_log_x=False,
+                log_vals=None,
+                x_range=(0, 100),
+            )
+            _ymid = judges[len(judges) // 2] if judges else ""
+            fig_var.add_annotation(
+                xref="x",
+                yref="y",
+                x=50,
+                y=_ymid,
+                text="No % zero variance (no pooled scores in this selection)",
+                showarrow=False,
+                font=dict(size=12, color="#555"),
+            )
+
+        with st.container(border=True):
+            st.markdown("##### Total spend (invoice / estimated)")
+            st.plotly_chart(fig_usd, use_container_width=True, key=f"{_chart_key}_usd")
+        with st.container(border=True):
+            st.markdown("##### JSONL tokens (summed over selected files)")
+            st.plotly_chart(fig_tok, use_container_width=True, key=f"{_chart_key}_tok")
+        with st.container(border=True):
+            st.markdown("##### Effective cost: USD per 1M tokens")
+            st.plotly_chart(fig_pm, use_container_width=True, key=f"{_chart_key}_pm")
+        with st.container(border=True):
+            st.markdown("##### Repeat stability: % zero variance")
+            st.plotly_chart(fig_var, use_container_width=True, key=f"{_chart_key}_var")
+
+    elif has_var:
+        spend_vals = tok_vals
+        log_top = _rel_econ_log_scale_ok(spend_vals)
+        tok_title = "JSONL tokens, log scale" if log_top else "JSONL tokens (sum)"
+
+        fig_t = go.Figure(
+            data=[
+                go.Bar(
+                    y=judges,
+                    x=spend_vals,
+                    orientation="h",
+                    marker_color=bar_colors,
+                    text=tok_txt,
+                    textposition="outside",
+                    cliponaxis=False,
+                    hovertemplate="<b>%{y}</b><br>Tokens: %{x:,.0f}<extra></extra>",
+                    showlegend=False,
+                )
+            ]
+        )
+        _rel_econ_style_single_hbar(
+            fig_t,
+            margin_l=lm,
+            n_judges=n,
+            x_title=tok_title,
+            use_log_x=log_top,
+            log_vals=spend_vals if log_top else None,
+        )
+
+        fig_v = go.Figure(
+            data=[
+                go.Bar(
+                    y=judges,
+                    x=var_vals,
+                    orientation="h",
+                    marker_color=bar_colors,
+                    text=var_txt,
+                    textposition="outside",
+                    cliponaxis=False,
+                    hovertemplate=(
+                        "<b>%{y}</b><br>% zero variance: %{x:.2f}<br>Repeat agree.: %{customdata[0]}<extra></extra>"
+                    ),
+                    customdata=[
+                        (
+                            f"{float(a):.1f}%"
+                            if a is not None and pd.notna(a)
+                            else "—"
+                        )
+                        for a in agree_vals
+                    ],
+                    showlegend=False,
+                )
+            ]
+        )
+        _rel_econ_style_single_hbar(
+            fig_v,
+            margin_l=lm,
+            n_judges=n,
+            x_title="% of items with zero variance (0–100)",
+            use_log_x=False,
+            log_vals=None,
+            x_range=(0, 100),
+        )
+
+        with st.container(border=True):
+            st.markdown("##### JSONL tokens (summed over selected files)")
+            st.plotly_chart(fig_t, use_container_width=True, key=f"{_chart_key}_tok")
+        with st.container(border=True):
+            st.markdown("##### Repeat stability: % zero variance")
+            st.plotly_chart(fig_v, use_container_width=True, key=f"{_chart_key}_var")
+
+    else:
+        log_top = _rel_econ_log_scale_ok(tok_vals)
+        tok_title = "JSONL tokens, log scale" if log_top else "JSONL tokens"
+        fig_only = go.Figure(
+            data=[
+                go.Bar(
+                    y=judges,
+                    x=tok_vals,
+                    orientation="h",
+                    marker_color=bar_colors,
+                    text=tok_txt,
+                    textposition="outside",
+                    cliponaxis=False,
+                    hovertemplate="<b>%{y}</b><br>Tokens: %{x:,.0f}<extra></extra>",
+                    showlegend=False,
+                )
+            ]
+        )
+        _rel_econ_style_single_hbar(
+            fig_only,
+            margin_l=lm,
+            n_judges=n,
+            x_title=tok_title,
+            use_log_x=log_top,
+            log_vals=tok_vals if log_top else None,
+        )
+        with st.container(border=True):
+            st.markdown("##### JSONL tokens")
+            st.plotly_chart(fig_only, use_container_width=True, key=f"{_chart_key}_single")
+
+    st.caption(
+        "Each bordered block is a separate chart; **titles** sit in the page, not inside the plot. "
+        "**Spend** and **USD / 1M tokens** are **linear** so you can compare dollars. **Token** bars may use a **log** "
+        "axis only when spreads are very wide (decade ticks; exact counts stay on the bars). Billing CSV changes "
+        "refresh the same panels."
+    )
+
+
 def _iter_judge_slices_for_compare(
     fname: str,
     rows: list,
@@ -314,12 +1023,22 @@ tab_names = [
     "Run Experiment",
     "View Results",
     "Compare judges & vendors",
+    "Run summary",
     "Telemetry",
     "Manage",
 ]
 tabs = st.tabs(tab_names)
 
-tab_overview, tab_dataset, tab_run, tab_view, tab_compare, tab_otel, tab_manage = (
+(
+    tab_overview,
+    tab_dataset,
+    tab_run,
+    tab_view,
+    tab_compare,
+    tab_run_summary,
+    tab_otel,
+    tab_manage,
+) = (
     tabs[0],
     tabs[1],
     tabs[2],
@@ -327,6 +1046,7 @@ tab_overview, tab_dataset, tab_run, tab_view, tab_compare, tab_otel, tab_manage 
     tabs[4],
     tabs[5],
     tabs[6],
+    tabs[7],
 )
 
 
@@ -972,7 +1692,29 @@ with tab_compare:
                             + ", ".join(_short_run_tag_from_results_filename(f) for f in empty_files)
                         )
                 else:
+                    _metric_line = (
+                        f" · metric **{compare_metric_choice}**"
+                        if compare_metric_choice
+                        else ""
+                    )
+                    st.caption(
+                        f"**Comparison:** {len(selected)} result file(s) · **{cond_filter_cmp}** · "
+                        f"**{dset_filter_cmp}**{_metric_line}. Tables and charts below use only these files and filters."
+                    )
+                    with st.expander("Included result files (audit)", expanded=False):
+                        for fn in selected:
+                            raw_rows = loaded_cmp[fn]
+                            filt_rows = _rows_for_single_metric(raw_rows, compare_metric_choice)
+                            eid = _first_execution_id(filt_rows if filt_rows else raw_rows)
+                            tag = _short_run_tag_from_results_filename(fn)
+                            st.markdown(
+                                f"- **`{fn}`** — run tag `{tag}` · **{len(filt_rows)}** rows after filters "
+                                f"({len(raw_rows)} loaded) · `execution_id` **{eid}**"
+                            )
+                            st.caption(str((RESULTS_DIR / fn).resolve()))
+
                     compare_data = []
+                    multi_file = len(selected) > 1
                     for s in nonempty:
                         summ = s["summ"]
                         rows = s["rows"]
@@ -986,10 +1728,11 @@ with tab_compare:
                             if by_item
                             else 0
                         )
-                        compare_data.append({
+                        row_out = {
                             "Condition": summ["condition"],
                             "Dataset": summ["dataset_id"],
                             "Judge": s["label"],
+                            "Vendor": _api_vendor_label(s["judge_key"]),
                             "Items": m1["n_items"],
                             "Distinct scores / judgments": (
                                 f"{hl_s['n_distinct_scores']} / {hl_s['n_judgments']}"
@@ -1013,13 +1756,22 @@ with tab_compare:
                             "Mean within-item SD": round(m1["mean_within_item_std"], 4),
                             "% zero variance": round(m1["pct_items_zero_variance"], 1),
                             "Repeat agreement (exact)": f"{m2['mean_agreement_rate']:.1%}",
-                        })
+                        }
+                        if multi_file:
+                            row_out["Source file"] = _short_run_tag_from_results_filename(s["fname"])
+                        compare_data.append(row_out)
 
                     st.subheader("Per-judge metrics")
                     st.dataframe(pd.DataFrame(compare_data), use_container_width=True)
+                    _src_note = (
+                        " **Source file** is the short run tag when multiple JSONLs are selected. "
+                        if multi_file
+                        else ""
+                    )
                     st.caption(
                         "**Distinct scores / judgments**, **% repeat pairs differ**, and **% items any repeat disagree** are all **within-item** summaries (not a pooled min/max across all scores). "
                         "**Judge** is the model id (plus a run tag only if the same model appears twice)."
+                        + _src_note
                     )
 
                     vendor_agg: dict = {}
@@ -1074,7 +1826,7 @@ with tab_compare:
                                     x="API",
                                     y="Weighted avg % zero variance",
                                     color="API",
-                                    color_discrete_map={"OpenAI": "#10a37f", "Anthropic": "#d4a574"},
+                                    color_discrete_map=VENDOR_BAR_COLOR_MAP,
                                 )
                                 fig_v.update_layout(
                                     yaxis_title="% zero variance (weighted)",
@@ -1089,7 +1841,7 @@ with tab_compare:
                                     x="API",
                                     y="Weighted avg within-item SD",
                                     color="API",
-                                    color_discrete_map={"OpenAI": "#10a37f", "Anthropic": "#d4a574"},
+                                    color_discrete_map=VENDOR_BAR_COLOR_MAP,
                                 )
                                 fig_w.update_layout(
                                     yaxis_title="Within-item SD (lower = tighter repeats)",
@@ -1105,7 +1857,11 @@ with tab_compare:
                         )
 
                     rel_data = [
-                        {"judge": r["Judge"], "pct_zero_variance": r["% zero variance"]}
+                        {
+                            "judge": r["Judge"],
+                            "pct_zero_variance": r["% zero variance"],
+                            "Vendor": r["Vendor"],
+                        }
                         for r in compare_data
                         if isinstance(r["% zero variance"], (int, float))
                     ]
@@ -1118,8 +1874,9 @@ with tab_compare:
                             x="pct_zero_variance",
                             y="judge",
                             orientation="h",
+                            color="Vendor",
+                            color_discrete_map=VENDOR_BAR_COLOR_MAP,
                         )
-                        fig.update_traces(marker_color="#808080")
                         fig.update_layout(
                             xaxis_title="% zero variance",
                             yaxis_title="",
@@ -1465,7 +2222,538 @@ with tab_run:
 
 
 
-# ==================== TAB 5: Telemetry (OTEL) ====================
+# ==================== TAB 5: Run summary (scores + economics) ====================
+with tab_run_summary:
+    st.header("Run summary")
+    st.caption(
+        "Pick every JSONL from a session (e.g. conditions **A**, **B**, **C** on the same benchmark). "
+        "**Panel mean score** is the average of each judge’s own mean score (every judge weighted equally). "
+        "**Tokens** are summed from `input_tokens` / `output_tokens` on each row. "
+        "**Selecting JSONLs does not** fill **Cost inputs** (no prices in JSONL): enter **per-1M rates** yourself, "
+        "or set **invoice** totals via CSV **Apply** / manual entry."
+    )
+    summaries_rs = _all_result_summaries()
+    if not summaries_rs:
+        st.info("No result files in results/.")
+    else:
+        rs_labels = [
+            f"{s['name']}  ·  {s['condition']}  ·  {s['dataset_id']}" for s in summaries_rs
+        ]
+        rs_map = {rs_labels[i]: summaries_rs[i]["name"] for i in range(len(summaries_rs))}
+        pick_rs = st.multiselect(
+            "Result JSONL files (e.g. all runs from today)",
+            rs_labels,
+            default=[],
+            key="run_summary_files_pick",
+        )
+
+        st.subheader("Vendor billing CSVs")
+        st.caption(
+            "Upload exports from OpenAI **usage / cost** and Anthropic **usage / cost** (same date window as the JSONLs). "
+            "We detect known column shapes and fill tables below; use **Apply** to copy **invoice-level USD** into the actual spend fields."
+        )
+        uploaded = st.file_uploader(
+            "Vendor CSV exports",
+            type=["csv"],
+            accept_multiple_files=True,
+            key="run_summary_csv_upload",
+        )
+        billing_parsed = None
+        if uploaded:
+            try:
+                billing_parsed = parse_uploaded_files(list(uploaded))
+            except Exception as e:
+                st.error(f"Could not parse uploads: {e}")
+            else:
+                with st.expander("Parsed values (from CSVs)", expanded=True):
+                    if billing_parsed.openai_total_usd is not None:
+                        st.metric("OpenAI project cost (from export)", f"${billing_parsed.openai_total_usd:.2f}")
+                    if billing_parsed.anthropic_total_usd is not None:
+                        st.metric("Anthropic token cost (from export)", f"${billing_parsed.anthropic_total_usd:.2f}")
+                    if billing_parsed.openai_by_model:
+                        st.markdown("**OpenAI — usage file** (requests / tokens)")
+                        odf = pd.DataFrame(
+                            [
+                                {
+                                    "model": m,
+                                    "requests": v["requests"],
+                                    "input_tokens": v["input"],
+                                    "output_tokens": v["output"],
+                                }
+                                for m, v in sorted(billing_parsed.openai_by_model.items())
+                            ]
+                        )
+                        st.dataframe(odf, use_container_width=True, hide_index=True)
+                    if billing_parsed.openai_line_items:
+                        st.markdown("**OpenAI — line-item costs** (model × usage type × USD)")
+                        st.dataframe(
+                            pd.DataFrame(billing_parsed.openai_line_items),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    if billing_parsed.anthropic_tokens_by_model:
+                        st.markdown("**Anthropic — token usage file**")
+                        adf = pd.DataFrame(
+                            [
+                                {"model": m, "input_tokens": v["in"], "output_tokens": v["out"]}
+                                for m, v in sorted(billing_parsed.anthropic_tokens_by_model.items())
+                            ]
+                        )
+                        st.dataframe(adf, use_container_width=True, hide_index=True)
+                    if billing_parsed.anthropic_cost_by_model:
+                        st.markdown("**Anthropic — cost file** (USD by model label)")
+                        cdf = pd.DataFrame(
+                            [
+                                {"model": m, "cost_usd": round(x, 4)}
+                                for m, x in sorted(billing_parsed.anthropic_cost_by_model.items())
+                            ]
+                        )
+                        st.dataframe(cdf, use_container_width=True, hide_index=True)
+                    for note in billing_parsed.notes:
+                        st.caption(note)
+                can_apply = (
+                    billing_parsed.openai_total_usd is not None
+                    or billing_parsed.anthropic_total_usd is not None
+                )
+                if st.button(
+                    "Apply parsed **invoice USD** to actual spend fields below",
+                    key="rs_billing_apply_btn",
+                    disabled=not can_apply,
+                ):
+                    if billing_parsed.openai_total_usd is not None:
+                        st.session_state["rs_actual_oai"] = float(billing_parsed.openai_total_usd)
+                    if billing_parsed.anthropic_total_usd is not None:
+                        st.session_state["rs_actual_ant"] = float(billing_parsed.anthropic_total_usd)
+                    st.rerun()
+
+        for _rs_key, _rs_default in (
+            ("rs_rate_oai_in", 0.0),
+            ("rs_rate_oai_out", 0.0),
+            ("rs_rate_ant_in", 0.0),
+            ("rs_rate_ant_out", 0.0),
+            ("rs_actual_oai", 0.0),
+            ("rs_actual_ant", 0.0),
+        ):
+            st.session_state.setdefault(_rs_key, _rs_default)
+
+        st.subheader("Cost inputs")
+        if pick_rs:
+            st.info(
+                "You have **result JSONLs** selected — **token counts** and scores are computed below from those files. "
+                "These inputs stay **0** until you set them yourself: JSONLs do **not** contain vendor prices. "
+                "Enter **USD per 1M** rates for row **Est. USD (rates)**; use **Apply** after uploading billing CSVs "
+                "(or type amounts) for **invoice** totals."
+            )
+        st.markdown(
+            "**Two different things**\n\n"
+            "1. **Per-1M-token rates (USD)** — Defaults below are **per vendor** (one pair for OpenAI, one for Anthropic). "
+            "After you select JSONLs, use **Per-model overrides** so each `judge_model` can have its own list price. "
+            "We multiply token counts by the effective rates to fill **Est. USD (rates)**. That total is "
+            "**not** the same as a vendor invoice unless every API call in the billing window is exactly these judges.\n\n"
+            "2. **Invoice totals (USD)** — **Whole-project** (or whole-day) amounts from your vendor UI or from CSV **Apply**. "
+            "Use **Totals** below to sanity-check the rate-based estimate.\n\n"
+            "**Upload-driven columns** in the table (**Export … OpenAI**, **Export … Anthropic**) come from parsed CSVs and "
+            "**do not** use the numeric rates in this section."
+        )
+        cr1, cr2 = st.columns(2)
+        with cr1:
+            st.markdown("**Rate-based estimate** — OpenAI (**USD per 1M tokens**)")
+            rate_oai_in = st.number_input(
+                "Prompt / input (USD per 1M tok)",
+                min_value=0.0,
+                step=0.1,
+                format="%.4f",
+                key="rs_rate_oai_in",
+                help="Cost = (input_tokens/1e6)×this + (output_tokens/1e6)×output rate. Fills **Est. USD (rates)** for OpenAI judges.",
+            )
+            rate_oai_out = st.number_input(
+                "Completion / output (USD per 1M tok)",
+                min_value=0.0,
+                step=0.1,
+                format="%.4f",
+                key="rs_rate_oai_out",
+                help="See **input** rate help. Leave at 0 if you only price input.",
+            )
+        with cr2:
+            st.markdown("**Rate-based estimate** — Anthropic (**USD per 1M tokens**)")
+            rate_ant_in = st.number_input(
+                "Prompt / input (USD per 1M tok)",
+                min_value=0.0,
+                step=0.1,
+                format="%.4f",
+                key="rs_rate_ant_in",
+                help="Same formula as OpenAI; used for **claude-** judges only.",
+            )
+            rate_ant_out = st.number_input(
+                "Completion / output (USD per 1M tok)",
+                min_value=0.0,
+                step=0.1,
+                format="%.4f",
+                key="rs_rate_ant_out",
+                help="See OpenAI **output** help.",
+            )
+        st.markdown("**Invoice totals (optional)** — entire billing window, not per-model")
+        ir1, ir2 = st.columns(2)
+        with ir1:
+            actual_oai = st.number_input(
+                "OpenAI invoice / dashboard total (USD)",
+                min_value=0.0,
+                step=1.0,
+                format="%.2f",
+                key="rs_actual_oai",
+                help="Project-wide OpenAI spend for the same date window as your CSVs. **Apply** on a parsed cost CSV fills this.",
+            )
+        with ir2:
+            actual_ant = st.number_input(
+                "Anthropic invoice / dashboard total (USD)",
+                min_value=0.0,
+                step=1.0,
+                format="%.2f",
+                key="rs_actual_ant",
+                help="Project-wide Anthropic spend. **Apply** fills this when the parser finds an Anthropic total.",
+            )
+
+        if not pick_rs:
+            st.info("Select one or more result files to see scores and token totals.")
+        else:
+            selected_names = [rs_map[L] for L in pick_rs]
+            file_stats: list = []
+            by_judge_all: dict = {}
+            file_judge_toks: dict = {}
+            reliability_rows: list = []
+            pooled_by_judge: dict = {}
+            conditions_seen: set = set()
+            total_in = total_out = 0
+
+            for fname in selected_names:
+                path = RESULTS_DIR / fname
+                rows = load_jsonl(path)
+                summ = _summarize_result_file(path)
+                conditions_seen.add(str(summ["condition"]))
+                pmean = _mean_panel_score(rows)
+                tag = _short_run_tag_from_results_filename(fname)
+                toks = _token_totals_by_judge(rows)
+                fin = fout = 0
+                for j, pr in toks.items():
+                    fin += pr["in"]
+                    fout += pr["out"]
+                    file_judge_toks[(fname, j)] = {"in": pr["in"], "out": pr["out"]}
+                    if j not in by_judge_all:
+                        by_judge_all[j] = {"in": 0, "out": 0}
+                    by_judge_all[j]["in"] += pr["in"]
+                    by_judge_all[j]["out"] += pr["out"]
+                total_in += fin
+                total_out += fout
+                n_scored = sum(1 for r in rows if r.get("score") is not None)
+                file_stats.append({
+                    "File tag": tag,
+                    "Filename": fname,
+                    "Condition": summ["condition"],
+                    "Dataset": summ["dataset_id"],
+                    "Rows": len(rows),
+                    "Rows with score": n_scored,
+                    "Panel mean score": round(pmean, 2) if pmean is not None else None,
+                    "Input tokens": fin,
+                    "Output tokens": fout,
+                })
+                for j in _unique_judge_models_in_rows(rows):
+                    slice_j = _rows_for_judge_model(rows, j)
+                    bucket = pooled_by_judge.setdefault(j, {})
+                    if summ["condition"] == "metric_rubric":
+                        metrics = sorted(
+                            {str(r.get("metric_name")) for r in slice_j if r.get("metric_name")}
+                        )
+                        for m in metrics:
+                            slice_m = _rows_for_single_metric(slice_j, m)
+                            by_item_m = _group_by_item(slice_m)
+                            for item_id, scores in by_item_m.items():
+                                bucket[f"{fname}\t{m}\t{item_id}"] = list(scores)
+                            rr = _run_summary_rel_row(tag, summ, j, m, by_item_m)
+                            rr["Filename"] = fname
+                            reliability_rows.append(rr)
+                    else:
+                        by_item_j = _group_by_item(slice_j)
+                        for item_id, scores in by_item_j.items():
+                            bucket[f"{fname}\t{item_id}"] = list(scores)
+                        rr = _run_summary_rel_row(tag, summ, j, "—", by_item_j)
+                        rr["Filename"] = fname
+                        reliability_rows.append(rr)
+
+            n_sel = len(selected_names)
+            conds_lbl = ", ".join(sorted(conditions_seen, key=str)) if conditions_seen else "—"
+            combined_tag = f"All selected (n={n_sel})"
+            synthetic_summ = {"condition": conds_lbl}
+
+            st.subheader("Per-model rate overrides (optional)")
+            st.caption(
+                "Pricing is usually **per model**, not per vendor. Leave a cell **empty** to use the **OpenAI** or **Anthropic** "
+                "defaults from **Cost inputs** for that side (input and/or output). Filled cells replace only that side for that row."
+            )
+            _stor_ov = st.session_state.get("rs_rate_overrides")
+            if not isinstance(_stor_ov, dict):
+                _stor_ov = {}
+            _rate_edit_rows = []
+            for j in sorted(by_judge_all.keys()):
+                _o = _stor_ov.get(j, {})
+                if not isinstance(_o, dict):
+                    _o = {}
+                _rate_edit_rows.append({
+                    "Judge": j,
+                    "Vendor": _api_vendor_label(j),
+                    "Input (USD/1M)": _o.get("in"),
+                    "Output (USD/1M)": _o.get("out"),
+                })
+            _rate_df = pd.DataFrame(_rate_edit_rows)
+            _edited_rates = st.data_editor(
+                _rate_df,
+                column_config={
+                    "Judge": st.column_config.TextColumn("Judge", disabled=True),
+                    "Vendor": st.column_config.TextColumn("Vendor", disabled=True),
+                    "Input (USD/1M)": st.column_config.NumberColumn(
+                        "Input (USD/1M)",
+                        format="%.4f",
+                        min_value=0.0,
+                        step=0.01,
+                    ),
+                    "Output (USD/1M)": st.column_config.NumberColumn(
+                        "Output (USD/1M)",
+                        format="%.4f",
+                        min_value=0.0,
+                        step=0.01,
+                    ),
+                },
+                hide_index=True,
+                num_rows="fixed",
+                key="rs_model_rate_editor",
+            )
+            rate_overrides: dict = {}
+            _active_j = frozenset(by_judge_all.keys())
+            for _, _r in _edited_rates.iterrows():
+                _jk = str(_r["Judge"]).strip()
+                if _jk not in _active_j:
+                    continue
+                _d = {}
+                if pd.notna(_r["Input (USD/1M)"]):
+                    _d["in"] = float(_r["Input (USD/1M)"])
+                if pd.notna(_r["Output (USD/1M)"]):
+                    _d["out"] = float(_r["Output (USD/1M)"])
+                if _d:
+                    rate_overrides[_jk] = _d
+            st.session_state["rs_rate_overrides"] = rate_overrides
+
+            rel_econ_combined_rows: list = []
+            for j in sorted(by_judge_all.keys()):
+                by_item_pool = pooled_by_judge.get(j, {})
+                rr = _run_summary_rel_row(
+                    combined_tag, synthetic_summ, j, "—", by_item_pool
+                )
+                rr["Filename"] = "—"
+                econ = _rel_econ_economics_for_judge(
+                    j,
+                    by_judge_all[j],
+                    rate_oai_in,
+                    rate_oai_out,
+                    rate_ant_in,
+                    rate_ant_out,
+                    billing_parsed,
+                    rate_overrides=rate_overrides,
+                )
+                rel_econ_combined_rows.append({**rr, **econ})
+
+            st.subheader("Per file")
+            st.dataframe(pd.DataFrame(file_stats), use_container_width=True, hide_index=True)
+
+            by_cond: dict = {}
+            for fs in file_stats:
+                c = fs["Condition"]
+                by_cond.setdefault(c, {"panel_means": [], "files": []})
+                if fs["Panel mean score"] is not None:
+                    by_cond[c]["panel_means"].append(fs["Panel mean score"])
+                by_cond[c]["files"].append(fs["File tag"])
+            if by_cond:
+                st.subheader("By condition (mean of file-level panel means)")
+                cond_rows = []
+                for c in sorted(by_cond.keys(), key=str):
+                    pm = by_cond[c]["panel_means"]
+                    cond_rows.append({
+                        "Condition": c,
+                        "Files (n)": len(by_cond[c]["files"]),
+                        "Avg panel mean": round(sum(pm) / len(pm), 2) if pm else None,
+                    })
+                st.dataframe(pd.DataFrame(cond_rows), use_container_width=True, hide_index=True)
+
+            if rel_econ_combined_rows:
+                st.subheader("Reliability × economics (per judge, all selected files)")
+                st.caption(
+                    "One row per **judge_model**. **JSONL tokens** and estimated cost use the **sum across every "
+                    "selected result file** (e.g. conditions A, B, C) so totals line up with a **daily** vendor export. "
+                    "Reliability metrics pool **within-file** repeat variance only: each judged item is keyed by "
+                    "**file** (and **metric** for condition B), so different rubrics are not mixed under the same "
+                    "`item_id`."
+                )
+                rel_econ_combined_df = pd.DataFrame(rel_econ_combined_rows)
+                st.dataframe(rel_econ_combined_df, use_container_width=True, hide_index=True)
+                _rel_econ_combined_charts(rel_econ_combined_df)
+
+            if reliability_rows:
+                with st.expander("Per file detail (judge × file × metric)", expanded=False):
+                    st.caption(
+                        "**metric_rubric:** one row per judge × metric × file. **A / C:** metric column is **—**. "
+                        "Export columns match uploaded billing CSVs (OpenAI ids prefix-matched; Anthropic labels as before)."
+                    )
+                    rel_econ_rows: list = []
+                    for rr in reliability_rows:
+                        judge = str(rr["Judge"])
+                        fname = str(rr["Filename"])
+                        pr = file_judge_toks.get((fname, judge), {"in": 0, "out": 0})
+                        econ = _rel_econ_economics_for_judge(
+                            judge,
+                            pr,
+                            rate_oai_in,
+                            rate_oai_out,
+                            rate_ant_in,
+                            rate_ant_out,
+                            billing_parsed,
+                            rate_overrides=rate_overrides,
+                        )
+                        rel_econ_rows.append({**rr, **econ})
+                    rel_econ_df = pd.DataFrame(rel_econ_rows)
+                    st.dataframe(rel_econ_df, use_container_width=True, hide_index=True)
+
+            st.subheader("Tokens by judge (all selected files combined)")
+            jrows = []
+            for j in sorted(by_judge_all.keys()):
+                pr = by_judge_all[j]
+                vendor = _api_vendor_label(j)
+                _ein, _eout, has_rates = _effective_rates_for_judge(
+                    j,
+                    vendor,
+                    rate_oai_in,
+                    rate_oai_out,
+                    rate_ant_in,
+                    rate_ant_out,
+                    rate_overrides,
+                )
+                est = _estimate_vendor_cost_us1m(
+                    float(pr["in"]), float(pr["out"]), _ein, _eout
+                )
+                jrows.append({
+                    "Judge": j,
+                    "Vendor": vendor,
+                    "Input tokens": pr["in"],
+                    "Output tokens": pr["out"],
+                    "Est. cost (rates above)": round(est, 4) if has_rates else None,
+                })
+            st.dataframe(pd.DataFrame(jrows), use_container_width=True, hide_index=True)
+
+            st.subheader("Totals")
+            est_oai = est_ant = 0.0
+            any_oai_r = any_ant_r = False
+            for j, pr in by_judge_all.items():
+                vendor = _api_vendor_label(j)
+                eff_in, eff_out, has_r = _effective_rates_for_judge(
+                    j,
+                    vendor,
+                    rate_oai_in,
+                    rate_oai_out,
+                    rate_ant_in,
+                    rate_ant_out,
+                    rate_overrides,
+                )
+                if not has_r:
+                    continue
+                t = _estimate_vendor_cost_us1m(
+                    float(pr["in"]),
+                    float(pr["out"]),
+                    eff_in,
+                    eff_out,
+                )
+                if is_claude_model(j):
+                    est_ant += t
+                    any_ant_r = True
+                else:
+                    est_oai += t
+                    any_oai_r = True
+            t1, t2, t3 = st.columns(3)
+            with t1:
+                st.metric("Input tokens (sum)", f"{total_in:,}")
+                st.metric("Output tokens (sum)", f"{total_out:,}")
+            with t2:
+                st.metric("Est. OpenAI (USD)", f"{est_oai:.2f}" if any_oai_r else "—")
+                st.metric("Est. Anthropic (USD)", f"{est_ant:.2f}" if any_ant_r else "—")
+            with t3:
+                st.metric(
+                    "Est. combined (USD)",
+                    f"{est_oai + est_ant:.2f}" if (any_oai_r or any_ant_r) else "—",
+                )
+                if actual_oai > 0 or actual_ant > 0:
+                    inv = actual_oai + actual_ant
+                    st.metric("Invoice entered (USD)", f"{inv:.2f}")
+                    est_sum = est_oai + est_ant
+                    if est_sum > 0 and (actual_oai > 0 or actual_ant > 0):
+                        parts = []
+                        if actual_oai > 0 and est_oai > 0:
+                            parts.append(f"OpenAI Δ **{actual_oai - est_oai:+.2f}** (invoice − JSONL×rates)")
+                        elif actual_oai > 0 and est_oai <= 0:
+                            parts.append("OpenAI: invoice set but no OpenAI **Est.** (add rates or pick OAI judges)")
+                        if actual_ant > 0 and est_ant > 0:
+                            parts.append(f"Anthropic Δ **{actual_ant - est_ant:+.2f}**")
+                        elif actual_ant > 0 and est_ant <= 0:
+                            parts.append("Anthropic: invoice set but no Anthropic **Est.**")
+                        if parts:
+                            st.caption(" · ".join(parts))
+                    st.caption(
+                        "Positive **Δ** usually means **other API usage** in the same billing period, caching, or "
+                        "pricing vs your **per-model / vendor** rate assumption — not a bug in the table."
+                    )
+
+            if (
+                pick_rs
+                and billing_parsed
+                and (billing_parsed.openai_by_model or billing_parsed.anthropic_tokens_by_model)
+            ):
+                st.subheader("Token cross-check (JSONL selection vs usage CSVs)")
+                st.caption(
+                    "Sums **all selected JSONLs**. Export model names may include snapshot suffixes (e.g. "
+                    "`gpt-4o-mini-2024-07-18`) not present in `judge_model` in the JSONL — use as a sanity check only."
+                )
+                jl_oai_in = jl_oai_out = jl_ant_in = jl_ant_out = 0
+                for j, pr in by_judge_all.items():
+                    if is_claude_model(j):
+                        jl_ant_in += pr["in"]
+                        jl_ant_out += pr["out"]
+                    else:
+                        jl_oai_in += pr["in"]
+                        jl_oai_out += pr["out"]
+                ex_oai_in = ex_oai_out = ex_ant_in = ex_ant_out = 0
+                for v in billing_parsed.openai_by_model.values():
+                    ex_oai_in += v["input"]
+                    ex_oai_out += v["output"]
+                for v in billing_parsed.anthropic_tokens_by_model.values():
+                    ex_ant_in += v["in"]
+                    ex_ant_out += v["out"]
+                chk = pd.DataFrame(
+                    [
+                        {
+                            "Bucket": "OpenAI",
+                            "JSONL input": jl_oai_in,
+                            "Export input": ex_oai_in,
+                            "JSONL output": jl_oai_out,
+                            "Export output": ex_oai_out,
+                        },
+                        {
+                            "Bucket": "Anthropic",
+                            "JSONL input": jl_ant_in,
+                            "Export input": ex_ant_in,
+                            "JSONL output": jl_ant_out,
+                            "Export output": ex_ant_out,
+                        },
+                    ]
+                )
+                st.dataframe(chk, use_container_width=True, hide_index=True)
+
+
+# ==================== TAB 6: Telemetry (OTEL) ====================
 with tab_otel:
     st.header("Telemetry (OTEL)")
     st.caption(
