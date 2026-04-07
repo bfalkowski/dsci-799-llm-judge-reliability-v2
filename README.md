@@ -64,7 +64,7 @@ Structured output (JSON: score 1–10, justification) is used for both. OpenTele
 - `experiments/` – experiment definitions and run configurations
 - `data/` – MT-Bench subset and dataset metadata
 - `results/` – judge output JSONL files (gitignored)
-- `src/` – evaluation scripts (`judge.py`, `run_repeated_judging.py`, `compute_metrics.py`, `otel_setup.py`)
+- `src/` – evaluation scripts (`judge.py`, `run_repeated_judging.py`, `compute_metrics.py`, `otel_setup.py`, `vendor_billing_csv.py` for dashboard billing CSV parsing)
 - `dashboard.py` – Streamlit UI for running experiments and viewing results
 - `dashboard_content/` – overview text, captions, and UI copy
 
@@ -91,7 +91,15 @@ Then use the URL Streamlit prints, or your host's forwarded port (e.g. `https://
 - **Overview** – project stages and goals
 - **Dataset & prompts** – view/edit `mt_bench*.json`, per-item `judge_instructions`, prompt preview
 - **Run Experiment** – select judge model, K repeats, run the pipeline
-- **View Results** – reliability metrics, charts, score distribution (single file)
-- **Compare Judges** – select 2+ result files to compare metrics and score distributions across judges
-- **Telemetry** – OTEL token usage, span status, per-item variance
+- **View Results** – reliability metrics, charts, score distribution (single JSONL)
+- **Compare judges & vendors** – multi-file comparison: per-judge metrics, vendor rollups, reliability bar chart (OpenAI vs Anthropic colors), spread-by-item when item sets align
+- **Run summary** – session-level rollups when you multi-select result JSONLs (e.g. conditions A, B, C):
+  - Scores and token totals per file; **Reliability × economics** table (one row per judge, tokens summed across selected files)
+  - **Cost inputs:** vendor default **USD per 1M** input/output rates; optional **per-model overrides** (table after files are selected); invoice totals from manual entry or **Apply** on uploaded billing CSVs (`src/vendor_billing_csv.py`)
+  - **Charts:** separate bordered panels for spend, tokens, USD/1M tokens, and pooled **% zero variance**; linear scales for money unless noted
+  - **Repeat stability (equal weight per condition):** condition **B** = mean of **% zero variance** over each B **metric** pool; composite = mean of present A / B / C (not every B item weighted as its own condition)
+  - **Mean score line chart** across conditions (A, each B metric, C): one line per judge; **y-axis 50–100**; **teal family** (OpenAI) vs **orange family** (Anthropic) with distinct shades per model
+- **Telemetry** – OTEL token usage, span status, per-item variance (when traces exist on the JSONL)
 - **Manage** – list and delete result files
+
+Python **3.8** is supported (e.g. `Tuple[...]` typing); use `streamlit run dashboard.py` with the same environment you used for `pip install`.
