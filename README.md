@@ -1,15 +1,17 @@
-# DSCI 799 – Reliability of LLM-as-a-Judge Evaluation
+# DSCI 799 – Repeat Stability in LLM-as-a-Judge Evaluation
 
-This repository contains the research artifacts for a DSCI 799 capstone project examining the
-reliability of automated LLM-as-a-judge evaluation.
+This repository contains the research artifacts for a DSCI 799 capstone project on **repeat
+stability** in automated LLM-as-a-judge evaluation: how much judge scores move when the same
+evaluation is run again under the same settings.
 
-The project studies how repeated executions of identical evaluations on fixed benchmark datasets
-(e.g., MT-Bench) can produce varying scores, and investigates when those scores correlate with
-human-labeled ground truth and when they become unreliable.
+The project studies repeated executions of identical evaluations on fixed benchmark datasets
+(e.g., MT-Bench), quantifies **repeat stability** (variance and agreement across repeats—not a
+single abstract “reliability” label), and investigates when those scores correlate with
+human-labeled ground truth and when they are too noisy to trust.
 
 ## Goals
 
-- Measure score variance and stability across repeated LLM-as-a-judge runs
+- Measure **repeat stability**: score variance and agreement across repeated LLM-as-a-judge runs
 - Analyze correlation between automated judgments and human preference data
 - Identify conditions under which LLM-as-a-judge provides meaningful evaluation signals
 
@@ -56,7 +58,7 @@ The judge supports two providers:
 | **OpenAI** | gpt-4o-mini, gpt-4o, gpt-4 | OPENAI_API_KEY |
 | **Anthropic** | claude-sonnet-4, claude-haiku-4-5, claude-opus-4 | ANTHROPIC_API_KEY |
 
-Structured output (JSON: score 1–10, justification) is used for both. OpenTelemetry records trace/span IDs and token usage per judgment for reliability analysis.
+Structured output (JSON: score 1–10, justification) is used for both. OpenTelemetry records trace/span IDs and token usage per judgment for repeat-stability and cost analysis.
 
 ## Repository Structure
 
@@ -91,10 +93,10 @@ Then use the URL Streamlit prints, or your host's forwarded port (e.g. `https://
 - **Overview** – project stages and goals
 - **Dataset & prompts** – view/edit `mt_bench*.json`, per-item `judge_instructions`, prompt preview
 - **Run Experiment** – select judge model, K repeats, run the pipeline
-- **View Results** – reliability metrics, charts, score distribution (single JSONL)
-- **Compare judges & vendors** – multi-file comparison: per-judge metrics, vendor rollups, reliability bar chart (OpenAI vs Anthropic colors), spread-by-item when item sets align
+- **View Results** – repeat-stability metrics, charts, score distribution (single JSONL)
+- **Compare judges & vendors** – multi-file comparison: per-judge metrics, vendor rollups, repeat-stability bar chart (e.g. % zero variance; OpenAI vs Anthropic colors), spread-by-item when item sets align
 - **Run summary** – session-level rollups when you multi-select result JSONLs (e.g. conditions A, B, C):
-  - Scores and token totals per file; **Reliability × economics** table (one row per judge, tokens summed across selected files)
+  - Scores and token totals per file; **Repeat stability × economics** table (one row per judge, tokens summed across selected files)
   - **Cost inputs:** vendor default **USD per 1M** input/output rates; optional **per-model overrides** (table after files are selected); invoice totals from manual entry or **Apply** on uploaded billing CSVs (`src/vendor_billing_csv.py`)
   - **Charts:** separate bordered panels for spend, tokens, USD/1M tokens, and pooled **% zero variance**; linear scales for money unless noted
   - **Repeat stability (equal weight per condition):** condition **B** = mean of **% zero variance** over each B **metric** pool; composite = mean of present A / B / C (not every B item weighted as its own condition)
