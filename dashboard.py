@@ -862,6 +862,249 @@ def _rel_econ_mean_score_line_by_condition(
         st.plotly_chart(fig, use_container_width=True, key=f"rel_econ_meanline_{_key_suf}")
 
 
+def _compute_mcd_mcb(all_file_rows: dict, fname_to_condition: dict) -> list:
+    """Compute leave-one-out MCD and MCB per judge from raw JSONL rows.
+
+    all_file_rows: {filename: [row_dicts, …]}
+    fname_to_condition: {filename: condition_name}
+
+    Returns list of dicts: [{Judge, Vendor, MCD, MCB, MCD_A, MCB_A, …}, …]
+    """
+    judge_item_scores = defaultdict(lambda: defaultdict(list))
+    for fname, rows in all_file_rows.items():
+        cond = fname_to_condition.get(fname, "")
+        for r in rows:
+            s = r.get("score")
+            if s is None:
+                continue
+            j = str(r.get("judge_model", "")).strip()
+            item_id = str(r.get("item_id", "")).strip()
+            metric = str(r.get("metric_name") or "").strip()
+            if cond == "metric_rubric" and metric:
+                key = (cond, metric, item_id)
+            else:
+                key = (cond, "", item_id)
+            judge_item_scores[j][key].append(s)
+
+    judges = sorted(judge_item_scores.keys())
+    if len(judges) < 2:
+        return []
+
+    all_keys = set()
+    for j in judges:
+        all_keys.update(judge_item_scores[j].keys())
+
+    judge_item_mean = {}
+    for j in judges:
+        for key in all_keys:
+            scores = judge_item_scores[j].get(key, [])
+            if scores:
+                judge_item_mean[(j, key)] = sum(scores) / len(scores)
+
+    conditions_in_keys = set()
+    for (cond, metric, _item) in all_keys:
+        conditions_in_keys.add(cond)
+
+    cond_labels = {
+        "generic_overall": "A",
+        "metric_rubric": "B",
+        "per_item_custom": "C",
+    }
+
+    def _loo_for_keys(keys_subset, judges_subset):
+        mcd_j, mcb_j = {}, {}
+        for j in judges_subset:
+            abs_d, signed_d = [], []
+            for key in keys_subset:
+                if (j, key) not in judge_item_mean:
+                    continue
+                others = [
+                    judge_item_mean[(jj, key)]
+                    for jj in judges_subset
+                    if jj != j and (jj, key) in judge_item_mean
+                ]
+                if not others:
+                    continue
+                diff = judge_item_mean[(j, key)] - sum(others) / len(others)
+                abs_d.append(abs(diff))
+                signed_d.append(diff)
+            mcd_j[j] = sum(abs_d) / len(abs_d) if abs_d else None
+            mcb_j[j] = sum(signed_d) / len(signed_d) if signed_d else None
+        return mcd_j, mcb_j
+
+    overall_mcd, overall_mcb = _loo_for_keys(all_keys, judges)
+
+    per_cond = {}
+    for cond in conditions_in_keys:
+        ckeys = {k for k in all_keys if k[0] == cond}
+        if ckeys:
+            m, b = _loo_for_keys(ckeys, judges)
+            lbl = cond_labels.get(cond, cond)
+            per_cond[lbl] = (m, b)
+
+    result = []
+    for j in judges:
+        row = {
+            "Judge": j,
+            "Vendor": _api_vendor_label(j),
+            "MCD": round(overall_mcd.get(j) or 0, 1),
+            "MCB": round(overall_mcb.get(j) or 0, 1),
+        }
+        for lbl in ("A", "B", "C"):
+            if lbl in per_cond:
+                m, b = per_cond[lbl]
+                row[f"MCD ({lbl})"] = round(m.get(j) or 0, 1) if m.get(j) is not None else None
+                row[f"MCB ({lbl})"] = round(b.get(j) or 0, 1) if b.get(j) is not None else None
+        result.append(row)
+    return result
+
+
+def _rel_econ_mcd_mcb_chart(
+    mcd_mcb_rows: list,
+    rel_econ_combined_df: pd.DataFrame,
+) -> None:
+    """Horizontal grouped bars: MCD (magnitude) and MCB (signed bias) per judge."""
+    if not mcd_mcb_rows:
+        return
+
+    cdf = rel_econ_combined_df.copy()
+    cdf["_usd_only"] = _rel_econ_unified_spend_series(cdf)
+    has_usd = (cdf["_usd_only"].notna() & (cdf["_usd_only"] > 0)).any()
+    cdf["_sort_key"] = cdf["_usd_only"] if has_usd else pd.to_numeric(cdf["JSONL tokens (sum)"], errors="coerce")
+    judge_order = cdf.sort_values("_sort_key", ascending=True, na_position="first")["Judge"].astype(str).tolist()
+
+    mcd_map = {r["Judge"]: r for r in mcd_mcb_rows}
+    judges = [j for j in judge_order if j in mcd_map]
+    if len(judges) < 2:
+        st.info("Need at least **2 judges** in the selected files to compute consensus deviation.")
+        return
+
+    mcd_vals = [mcd_map[j]["MCD"] for j in judges]
+    mcb_vals = [mcd_map[j]["MCB"] for j in judges]
+    vendors = [mcd_map[j]["Vendor"] for j in judges]
+
+    per_cond_cols = [c for c in ("MCD (A)", "MCD (B)", "MCD (C)") if c in mcd_mcb_rows[0]]
+    per_cond_b_cols = [c for c in ("MCB (A)", "MCB (B)", "MCB (C)") if c in mcd_mcb_rows[0]]
+
+    hover_parts = ["<b>%{y}</b>"]
+    hover_parts.append("MCD: %{customdata[0]:.1f} pts")
+    hover_parts.append("MCB: %{customdata[1]:+.1f} pts")
+    cd_indices = 2
+    for col in per_cond_cols:
+        lbl = col.replace("MCD ", "")
+        hover_parts.append(f"MCD {lbl}: %{{customdata[{cd_indices}]:.1f}}")
+        cd_indices += 1
+    for col in per_cond_b_cols:
+        lbl = col.replace("MCB ", "")
+        hover_parts.append(f"MCB {lbl}: %{{customdata[{cd_indices}]:+.1f}}")
+        cd_indices += 1
+    hover_template = "<br>".join(hover_parts) + "<extra></extra>"
+
+    customdata = []
+    for j in judges:
+        row_data = [mcd_map[j]["MCD"], mcd_map[j]["MCB"]]
+        for col in per_cond_cols:
+            row_data.append(mcd_map[j].get(col) or 0)
+        for col in per_cond_b_cols:
+            row_data.append(mcd_map[j].get(col) or 0)
+        customdata.append(row_data)
+
+    mcd_colors = [VENDOR_BAR_COLOR_MAP.get(v, "#6366f1") for v in vendors]
+    mcb_colors = ["#e74c3c" if v < 0 else "#27ae60" for v in mcb_vals]
+
+    mcd_labels = [f"{v:.1f}" for v in mcd_vals]
+    mcb_labels = [f"{v:+.1f}" for v in mcb_vals]
+
+    fig_mcd = go.Figure(
+        data=[
+            go.Bar(
+                y=judges,
+                x=mcd_vals,
+                orientation="h",
+                marker_color=mcd_colors,
+                text=mcd_labels,
+                textposition="outside",
+                cliponaxis=False,
+                customdata=customdata,
+                hovertemplate=hover_template,
+                showlegend=False,
+            )
+        ]
+    )
+    n = len(judges)
+    lm = _rel_econ_left_margin_for_labels(judges)
+    _rel_econ_style_single_hbar(
+        fig_mcd, margin_l=lm, n_judges=n,
+        x_title="Points",
+        use_log_x=False, log_vals=None,
+        x_range=(0, max(mcd_vals) * 1.25 if mcd_vals else 25),
+    )
+
+    fig_mcb = go.Figure(
+        data=[
+            go.Bar(
+                y=judges,
+                x=mcb_vals,
+                orientation="h",
+                marker_color=mcb_colors,
+                text=mcb_labels,
+                textposition="outside",
+                cliponaxis=False,
+                customdata=customdata,
+                hovertemplate=hover_template,
+                showlegend=False,
+            )
+        ]
+    )
+    x_abs_max = max(abs(v) for v in mcb_vals) * 1.35 if mcb_vals else 20
+    _rel_econ_style_single_hbar(
+        fig_mcb, margin_l=lm, n_judges=n,
+        x_title="Points",
+        use_log_x=False, log_vals=None,
+        x_range=(-x_abs_max, x_abs_max),
+    )
+    fig_mcb.add_vline(x=0, line_color="#999", line_width=1, line_dash="dot")
+
+    _tok_sum = int(pd.to_numeric(cdf["JSONL tokens (sum)"], errors="coerce").fillna(0).sum())
+    _key_suf = f"mcdmcb_{n}_{_tok_sum}"
+
+    st.subheader("Cross-judge consensus: MCD & MCB (leave-one-out)")
+    st.caption(
+        "**MCD** (Mean Consensus Deviation) = average absolute distance from the other judges' "
+        "consensus score on each item. **MCB** (Mean Consensus Bias) = same but **signed**: "
+        "**positive = lenient** (scores above consensus), **negative = harsh** (below). "
+        "Consensus is **leave-one-out**: each judge is compared to the mean of the other judges, "
+        "so its own score does not bias the reference."
+    )
+
+    tbl_rows = []
+    for j in judges:
+        r = mcd_map[j]
+        tbl_row = {"Judge": j, "Vendor": r["Vendor"], "MCD (pts)": r["MCD"], "MCB (pts)": r["MCB"]}
+        for col in per_cond_cols + per_cond_b_cols:
+            tbl_row[col] = r.get(col)
+        tbl_rows.append(tbl_row)
+    st.dataframe(pd.DataFrame(tbl_rows), use_container_width=True, hide_index=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        with st.container(border=True):
+            st.markdown("##### MCD — magnitude of disagreement")
+            st.caption(
+                "How far this judge typically sits from what the other judges scored on the same item. "
+                "Higher = more of an outlier."
+            )
+            st.plotly_chart(fig_mcd, use_container_width=True, key=f"rel_econ_mcd_{_key_suf}")
+    with c2:
+        with st.container(border=True):
+            st.markdown("##### MCB — scoring bias direction")
+            st.caption(
+                "Same distance but **signed**: **green / positive = lenient** (scores above the group), "
+                "**red / negative = harsh** (below the group). A bar near zero means no systematic lean."
+            )
+            st.plotly_chart(fig_mcb, use_container_width=True, key=f"rel_econ_mcb_{_key_suf}")
+
+
 def _rel_econ_combined_charts(rel_econ_combined_df: pd.DataFrame) -> None:
     """Aligned horizontal bars: when USD exists → cost, tokens, $/1M tokens, repeat stability; else tokens + stability."""
     cdf = rel_econ_combined_df.copy()
@@ -2770,11 +3013,13 @@ with tab_run_summary:
             pooled_by_judge: dict = {}
             conditions_seen: set = set()
             fname_to_condition: dict = {}
+            all_file_rows: dict = {}
             total_in = total_out = 0
 
             for fname in selected_names:
                 path = RESULTS_DIR / fname
                 rows = load_jsonl(path)
+                all_file_rows[fname] = rows
                 summ = _summarize_result_file(path)
                 fname_to_condition[fname] = summ["condition"]
                 conditions_seen.add(str(summ["condition"]))
@@ -2948,6 +3193,10 @@ with tab_run_summary:
                     fname_to_condition,
                 )
                 _rel_econ_mean_score_line_by_condition(reliability_rows, rel_econ_combined_df)
+
+                mcd_mcb_rows = _compute_mcd_mcb(all_file_rows, fname_to_condition)
+                if mcd_mcb_rows:
+                    _rel_econ_mcd_mcb_chart(mcd_mcb_rows, rel_econ_combined_df)
 
             if reliability_rows:
                 with st.expander("Per file detail (judge × file × metric)", expanded=False):
