@@ -1,4 +1,4 @@
-"""Streamlit dashboard for LLM-as-a-judge reliability experiments."""
+"""Streamlit dashboard for LLM-as-a-judge repeat-stability experiments."""
 
 import json
 import math
@@ -444,7 +444,7 @@ def _rel_econ_economics_for_judge(
     billing_parsed,
     rate_overrides: Optional[dict] = None,
 ) -> dict:
-    """Token totals + estimated / export USD columns for Reliability × economics."""
+    """Token totals + estimated / export USD columns for Repeat stability × economics."""
     vendor = _api_vendor_label(judge)
     eff_in, eff_out, has_rate = _effective_rates_for_judge(
         judge,
@@ -852,11 +852,11 @@ def _rel_econ_mean_score_line_by_condition(
 
     st.subheader("Mean score across conditions (all judges)")
     st.caption(
-        "One **line** per **judge_model**, same order as economics rows (by spend / tokens). **A** and **C** are the "
+        "One **line** per **judge_model**. **A** and **C** are the "
         "overall **mean score** for that condition (averaged across files if you picked several). **B** adds one point "
         "**per metric_name**. Missing points break the line (no score for that slice). **OpenAI** judges use **teal / "
-        "emerald** shades (each model a different step); **Anthropic** judges use **orange / terracotta** the same way. "
-        "**Y-axis is 50–100** to spread out typical judge means; values under 50 are clipped (hover still shows the real score)."
+        "emerald** shades; **Anthropic** judges use **orange / terracotta**. "
+        "**Y-axis is 50\u2013100** to spread out typical judge means; values under 50 are clipped (hover still shows the real score)."
     )
     with st.container(border=True):
         st.plotly_chart(fig, use_container_width=True, key=f"rel_econ_meanline_{_key_suf}")
@@ -1117,7 +1117,7 @@ def _rel_econ_combined_charts(rel_econ_combined_df: pd.DataFrame) -> None:
     if n == 0:
         return
 
-    st.subheader("Economics & reliability (charts)")
+    st.subheader("Economics & repeat stability (charts)")
     if has_usd:
         if has_var:
             st.caption(
@@ -1138,7 +1138,7 @@ def _rel_econ_combined_charts(rel_econ_combined_df: pd.DataFrame) -> None:
         )
     else:
         st.caption(
-            "**JSONL tokens** only — no USD and no reliability column in this view."
+            "**JSONL tokens** only — no USD and no repeat-stability column in this view."
         )
 
     cdf_plot = cdf.sort_values("_sort_key", ascending=True, na_position="first")
@@ -1590,7 +1590,7 @@ RUBRIC_GEN_MODEL_PRESETS = list(JUDGE_MODEL_BATCH_PRESETS) + ["Custom..."]
 
 
 # --- Page config and title ---
-st.set_page_config(page_title="LLM-as-a-Judge Reliability", layout="wide")
+st.set_page_config(page_title="LLM-as-a-Judge Repeat Stability", layout="wide")
 
 # Load and inject custom CSS
 def _load_css():
@@ -1603,39 +1603,27 @@ _css = _load_css()
 if _css:
     st.markdown(f"<style>{_css}</style>", unsafe_allow_html=True)
 
-st.title(_captions.get("title", "LLM-as-a-Judge Reliability & Execution Integrity"))
+st.title(_captions.get("title", "LLM-as-a-Judge Repeat Stability"))
 
 # --- Tab structure ---
 tab_names = [
     "Overview",
     "Dataset & prompts",
-    "Run Experiment",
     "View Results",
-    "Compare judges & vendors",
     "Run summary",
-    "Telemetry",
-    "Manage",
 ]
 tabs = st.tabs(tab_names)
 
 (
     tab_overview,
     tab_dataset,
-    tab_run,
     tab_view,
-    tab_compare,
     tab_run_summary,
-    tab_otel,
-    tab_manage,
 ) = (
     tabs[0],
     tabs[1],
     tabs[2],
     tabs[3],
-    tabs[4],
-    tabs[5],
-    tabs[6],
-    tabs[7],
 )
 
 
@@ -1986,7 +1974,7 @@ with tab_view:
                 view_metric_filter = None
                 if len(metric_opts) == 1:
                     view_metric_filter = metric_opts[0]
-                    st.caption(f"Condition **B** — reliability for metric **{view_metric_filter}** only.")
+                    st.caption(f"Condition **B** — repeat stability for metric **{view_metric_filter}** only.")
                 elif len(metric_opts) > 1:
                     view_metric_filter = st.selectbox(
                         "Metric (this file)",
@@ -2032,7 +2020,7 @@ with tab_view:
                     st.info("No scored judgments in this slice.")
     
                 # Metrics section
-                st.subheader("Reliability metrics (detail)")
+                st.subheader("Repeat stability metrics (detail)")
                 st.caption(
                     "**Mean variance** averages per-item **sample** variances (divide by K−1 within each item). "
                     "With **K=2**, one wild item can inflate the mean — use **Repeat variability** above and **Avg spread** below."
@@ -2058,8 +2046,7 @@ with tab_view:
                     st.metric("Items analyzed", f"{m1['n_items']}")
                     st.caption("Distinct item_ids in this slice")
     
-                # Overall reliability: stable vs unstable
-                st.subheader("Overall reliability")
+                st.subheader("Overall repeat stability")
                 st.caption(
                     "Non-zero variance = judge instability (same response, different scores across repeats)."
                 )
@@ -2156,8 +2143,9 @@ with tab_view:
                 st.info("File is empty.")
 
 
-# ==================== TAB 4: Compare judges & vendors ==============
-with tab_compare:
+# ==================== TAB: Compare judges & vendors (hidden for presentation) ==============
+if False:  # tab removed for presentation
+ with st.container():
     st.header("Compare judges & vendors")
     st.caption(
         "Pick **condition** and **dataset**, then one or more result files. Tables split by **judge_model**; "
@@ -2455,7 +2443,7 @@ with tab_compare:
                         if isinstance(r["% zero variance"], (int, float))
                     ]
                     if rel_data:
-                        st.subheader("Reliability: % items with zero variance")
+                        st.subheader("Repeat stability: % items with zero variance")
                         st.caption("Higher = more stable. Same item, same response → identical scores across repeats.")
                         rel_df = pd.DataFrame(rel_data)
                         fig = px.bar(
@@ -2475,7 +2463,7 @@ with tab_compare:
                         )
                         st.plotly_chart(fig, use_container_width=True)
                     else:
-                        st.info("No reliability data to chart (select files with valid judgments).")
+                        st.info("No repeat-stability data to chart (select files with valid judgments).")
 
                     st.subheader("Score spread per item across judges")
                     st.caption(
@@ -2557,8 +2545,9 @@ with tab_compare:
                             )
 
 
-# ==================== TAB 2: Run Experiment ==============
-with tab_run:
+# ==================== TAB: Run Experiment (hidden for presentation) ==============
+if False:  # tab removed for presentation
+ with st.container():
     st.header(
         "Run Experiment",
         anchor=False,
@@ -2811,15 +2800,13 @@ with tab_run:
 
 
 
-# ==================== TAB 5: Run summary (scores + economics) ====================
+# ==================== TAB: Run summary ====================
 with tab_run_summary:
     st.header("Run summary")
     st.caption(
-        "Pick every JSONL from a session (e.g. conditions **A**, **B**, **C** on the same benchmark). "
-        "**Panel mean score** is the average of each judge’s own mean score (every judge weighted equally). "
-        "**Tokens** are summed from `input_tokens` / `output_tokens` on each row. "
-        "**Selecting JSONLs does not** fill **Cost inputs** (no prices in JSONL): enter **per-1M rates** yourself, "
-        "or set **invoice** totals via CSV **Apply** / manual entry."
+        "Select every JSONL from a session (e.g. conditions **A**, **B**, **C** on the same benchmark). "
+        "**Repeat stability (RS%)** is the share of items with identical integer scores across K repeats. "
+        "**MCD / MCB** quantify cross-judge consensus alignment and directional scoring bias."
     )
     summaries_rs = _all_result_summaries()
     if not summaries_rs:
@@ -2836,185 +2823,17 @@ with tab_run_summary:
             key="run_summary_files_pick",
         )
 
-        st.subheader("Vendor billing CSVs")
-        st.caption(
-            "Upload exports from OpenAI **usage / cost** and Anthropic **usage / cost** (same date window as the JSONLs). "
-            "We detect known column shapes and fill tables below; use **Apply** to copy **invoice-level USD** into the actual spend fields."
-        )
-        uploaded = st.file_uploader(
-            "Vendor CSV exports",
-            type=["csv"],
-            accept_multiple_files=True,
-            key="run_summary_csv_upload",
-        )
-        billing_parsed = None
-        if uploaded:
-            try:
-                billing_parsed = parse_uploaded_files(list(uploaded))
-            except Exception as e:
-                st.error(f"Could not parse uploads: {e}")
-            else:
-                with st.expander("Parsed values (from CSVs)", expanded=True):
-                    if billing_parsed.openai_total_usd is not None:
-                        st.metric("OpenAI project cost (from export)", f"${billing_parsed.openai_total_usd:.2f}")
-                    if billing_parsed.anthropic_total_usd is not None:
-                        st.metric("Anthropic token cost (from export)", f"${billing_parsed.anthropic_total_usd:.2f}")
-                    if billing_parsed.openai_by_model:
-                        st.markdown("**OpenAI — usage file** (requests / tokens)")
-                        odf = pd.DataFrame(
-                            [
-                                {
-                                    "model": m,
-                                    "requests": v["requests"],
-                                    "input_tokens": v["input"],
-                                    "output_tokens": v["output"],
-                                }
-                                for m, v in sorted(billing_parsed.openai_by_model.items())
-                            ]
-                        )
-                        st.dataframe(odf, use_container_width=True, hide_index=True)
-                    if billing_parsed.openai_line_items:
-                        st.markdown("**OpenAI — line-item costs** (model × usage type × USD)")
-                        st.dataframe(
-                            pd.DataFrame(billing_parsed.openai_line_items),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-                    if billing_parsed.anthropic_tokens_by_model:
-                        st.markdown("**Anthropic — token usage file**")
-                        adf = pd.DataFrame(
-                            [
-                                {"model": m, "input_tokens": v["in"], "output_tokens": v["out"]}
-                                for m, v in sorted(billing_parsed.anthropic_tokens_by_model.items())
-                            ]
-                        )
-                        st.dataframe(adf, use_container_width=True, hide_index=True)
-                    if billing_parsed.anthropic_cost_by_model:
-                        st.markdown("**Anthropic — cost file** (USD by model label)")
-                        cdf = pd.DataFrame(
-                            [
-                                {"model": m, "cost_usd": round(x, 4)}
-                                for m, x in sorted(billing_parsed.anthropic_cost_by_model.items())
-                            ]
-                        )
-                        st.dataframe(cdf, use_container_width=True, hide_index=True)
-                    for note in billing_parsed.notes:
-                        st.caption(note)
-                can_apply = (
-                    billing_parsed.openai_total_usd is not None
-                    or billing_parsed.anthropic_total_usd is not None
-                )
-                if st.button(
-                    "Apply parsed **invoice USD** to actual spend fields below",
-                    key="rs_billing_apply_btn",
-                    disabled=not can_apply,
-                ):
-                    if billing_parsed.openai_total_usd is not None:
-                        st.session_state["rs_actual_oai"] = float(billing_parsed.openai_total_usd)
-                    if billing_parsed.anthropic_total_usd is not None:
-                        st.session_state["rs_actual_ant"] = float(billing_parsed.anthropic_total_usd)
-                    st.rerun()
-
-        for _rs_key, _rs_default in (
-            ("rs_rate_oai_in", 0.0),
-            ("rs_rate_oai_out", 0.0),
-            ("rs_rate_ant_in", 0.0),
-            ("rs_rate_ant_out", 0.0),
-            ("rs_actual_oai", 0.0),
-            ("rs_actual_ant", 0.0),
-        ):
-            st.session_state.setdefault(_rs_key, _rs_default)
-
-        st.subheader("Cost inputs")
-        if pick_rs:
-            st.info(
-                "You have **result JSONLs** selected — **token counts** and scores are computed below from those files. "
-                "These inputs stay **0** until you set them yourself: JSONLs do **not** contain vendor prices. "
-                "Enter **USD per 1M** rates for row **Est. USD (rates)**; use **Apply** after uploading billing CSVs "
-                "(or type amounts) for **invoice** totals."
-            )
-        st.markdown(
-            "**Two different things**\n\n"
-            "1. **Per-1M-token rates (USD)** — Defaults below are **per vendor** (one pair for OpenAI, one for Anthropic). "
-            "After you select JSONLs, use **Per-model overrides** so each `judge_model` can have its own list price. "
-            "We multiply token counts by the effective rates to fill **Est. USD (rates)**. That total is "
-            "**not** the same as a vendor invoice unless every API call in the billing window is exactly these judges.\n\n"
-            "2. **Invoice totals (USD)** — **Whole-project** (or whole-day) amounts from your vendor UI or from CSV **Apply**. "
-            "Use **Totals** below to sanity-check the rate-based estimate.\n\n"
-            "**Upload-driven columns** in the table (**Export … OpenAI**, **Export … Anthropic**) come from parsed CSVs and "
-            "**do not** use the numeric rates in this section."
-        )
-        cr1, cr2 = st.columns(2)
-        with cr1:
-            st.markdown("**Rate-based estimate** — OpenAI (**USD per 1M tokens**)")
-            rate_oai_in = st.number_input(
-                "Prompt / input (USD per 1M tok)",
-                min_value=0.0,
-                step=0.1,
-                format="%.4f",
-                key="rs_rate_oai_in",
-                help="Cost = (input_tokens/1e6)×this + (output_tokens/1e6)×output rate. Fills **Est. USD (rates)** for OpenAI judges.",
-            )
-            rate_oai_out = st.number_input(
-                "Completion / output (USD per 1M tok)",
-                min_value=0.0,
-                step=0.1,
-                format="%.4f",
-                key="rs_rate_oai_out",
-                help="See **input** rate help. Leave at 0 if you only price input.",
-            )
-        with cr2:
-            st.markdown("**Rate-based estimate** — Anthropic (**USD per 1M tokens**)")
-            rate_ant_in = st.number_input(
-                "Prompt / input (USD per 1M tok)",
-                min_value=0.0,
-                step=0.1,
-                format="%.4f",
-                key="rs_rate_ant_in",
-                help="Same formula as OpenAI; used for **claude-** judges only.",
-            )
-            rate_ant_out = st.number_input(
-                "Completion / output (USD per 1M tok)",
-                min_value=0.0,
-                step=0.1,
-                format="%.4f",
-                key="rs_rate_ant_out",
-                help="See OpenAI **output** help.",
-            )
-        st.markdown("**Invoice totals (optional)** — entire billing window, not per-model")
-        ir1, ir2 = st.columns(2)
-        with ir1:
-            actual_oai = st.number_input(
-                "OpenAI invoice / dashboard total (USD)",
-                min_value=0.0,
-                step=1.0,
-                format="%.2f",
-                key="rs_actual_oai",
-                help="Project-wide OpenAI spend for the same date window as your CSVs. **Apply** on a parsed cost CSV fills this.",
-            )
-        with ir2:
-            actual_ant = st.number_input(
-                "Anthropic invoice / dashboard total (USD)",
-                min_value=0.0,
-                step=1.0,
-                format="%.2f",
-                key="rs_actual_ant",
-                help="Project-wide Anthropic spend. **Apply** fills this when the parser finds an Anthropic total.",
-            )
-
         if not pick_rs:
-            st.info("Select one or more result files to see scores and token totals.")
+            st.info("Select one or more result files to see repeat stability metrics.")
         else:
             selected_names = [rs_map[L] for L in pick_rs]
             file_stats: list = []
             by_judge_all: dict = {}
-            file_judge_toks: dict = {}
             reliability_rows: list = []
             pooled_by_judge: dict = {}
             conditions_seen: set = set()
             fname_to_condition: dict = {}
             all_file_rows: dict = {}
-            total_in = total_out = 0
 
             for fname in selected_names:
                 path = RESULTS_DIR / fname
@@ -3026,17 +2845,11 @@ with tab_run_summary:
                 pmean = _mean_panel_score(rows)
                 tag = _short_run_tag_from_results_filename(fname)
                 toks = _token_totals_by_judge(rows)
-                fin = fout = 0
                 for j, pr in toks.items():
-                    fin += pr["in"]
-                    fout += pr["out"]
-                    file_judge_toks[(fname, j)] = {"in": pr["in"], "out": pr["out"]}
                     if j not in by_judge_all:
                         by_judge_all[j] = {"in": 0, "out": 0}
                     by_judge_all[j]["in"] += pr["in"]
                     by_judge_all[j]["out"] += pr["out"]
-                total_in += fin
-                total_out += fout
                 n_scored = sum(1 for r in rows if r.get("score") is not None)
                 file_stats.append({
                     "File tag": tag,
@@ -3046,8 +2859,6 @@ with tab_run_summary:
                     "Rows": len(rows),
                     "Rows with score": n_scored,
                     "Panel mean score": round(pmean, 2) if pmean is not None else None,
-                    "Input tokens": fin,
-                    "Output tokens": fout,
                 })
                 for j in _unique_judge_models_in_rows(rows):
                     slice_j = _rows_for_judge_model(rows, j)
@@ -3077,63 +2888,6 @@ with tab_run_summary:
             combined_tag = f"All selected (n={n_sel})"
             synthetic_summ = {"condition": conds_lbl}
 
-            st.subheader("Per-model rate overrides (optional)")
-            st.caption(
-                "Pricing is usually **per model**, not per vendor. Leave a cell **empty** to use the **OpenAI** or **Anthropic** "
-                "defaults from **Cost inputs** for that side (input and/or output). Filled cells replace only that side for that row."
-            )
-            _stor_ov = st.session_state.get("rs_rate_overrides")
-            if not isinstance(_stor_ov, dict):
-                _stor_ov = {}
-            _rate_edit_rows = []
-            for j in sorted(by_judge_all.keys()):
-                _o = _stor_ov.get(j, {})
-                if not isinstance(_o, dict):
-                    _o = {}
-                _rate_edit_rows.append({
-                    "Judge": j,
-                    "Vendor": _api_vendor_label(j),
-                    "Input (USD/1M)": _o.get("in"),
-                    "Output (USD/1M)": _o.get("out"),
-                })
-            _rate_df = pd.DataFrame(_rate_edit_rows)
-            _edited_rates = st.data_editor(
-                _rate_df,
-                column_config={
-                    "Judge": st.column_config.TextColumn("Judge", disabled=True),
-                    "Vendor": st.column_config.TextColumn("Vendor", disabled=True),
-                    "Input (USD/1M)": st.column_config.NumberColumn(
-                        "Input (USD/1M)",
-                        format="%.4f",
-                        min_value=0.0,
-                        step=0.01,
-                    ),
-                    "Output (USD/1M)": st.column_config.NumberColumn(
-                        "Output (USD/1M)",
-                        format="%.4f",
-                        min_value=0.0,
-                        step=0.01,
-                    ),
-                },
-                hide_index=True,
-                num_rows="fixed",
-                key="rs_model_rate_editor",
-            )
-            rate_overrides: dict = {}
-            _active_j = frozenset(by_judge_all.keys())
-            for _, _r in _edited_rates.iterrows():
-                _jk = str(_r["Judge"]).strip()
-                if _jk not in _active_j:
-                    continue
-                _d = {}
-                if pd.notna(_r["Input (USD/1M)"]):
-                    _d["in"] = float(_r["Input (USD/1M)"])
-                if pd.notna(_r["Output (USD/1M)"]):
-                    _d["out"] = float(_r["Output (USD/1M)"])
-                if _d:
-                    rate_overrides[_jk] = _d
-            st.session_state["rs_rate_overrides"] = rate_overrides
-
             rel_econ_combined_rows: list = []
             for j in sorted(by_judge_all.keys()):
                 by_item_pool = pooled_by_judge.get(j, {})
@@ -3141,17 +2895,10 @@ with tab_run_summary:
                     combined_tag, synthetic_summ, j, "—", by_item_pool
                 )
                 rr["Filename"] = "—"
-                econ = _rel_econ_economics_for_judge(
-                    j,
-                    by_judge_all[j],
-                    rate_oai_in,
-                    rate_oai_out,
-                    rate_ant_in,
-                    rate_ant_out,
-                    billing_parsed,
-                    rate_overrides=rate_overrides,
-                )
-                rel_econ_combined_rows.append({**rr, **econ})
+                rr["Vendor"] = _api_vendor_label(j)
+                tok = by_judge_all[j]
+                rr["JSONL tokens (sum)"] = int(tok["in"]) + int(tok["out"])
+                rel_econ_combined_rows.append(rr)
 
             st.subheader("Per file")
             st.dataframe(pd.DataFrame(file_stats), use_container_width=True, hide_index=True)
@@ -3176,17 +2923,22 @@ with tab_run_summary:
                 st.dataframe(pd.DataFrame(cond_rows), use_container_width=True, hide_index=True)
 
             if rel_econ_combined_rows:
-                st.subheader("Reliability × economics (per judge, all selected files)")
+                st.subheader("Repeat stability per judge (all selected files)")
                 st.caption(
-                    "One row per **judge_model**. **JSONL tokens** and estimated cost use the **sum across every "
-                    "selected result file** (e.g. conditions A, B, C) so totals line up with a **daily** vendor export. "
-                    "Reliability metrics pool **within-file** repeat variance only: each judged item is keyed by "
-                    "**file** (and **metric** for condition B), so different rubrics are not mixed under the same "
-                    "`item_id`."
+                    "One row per **judge_model**. Repeat-stability metrics pool **within-file** repeat variance only: "
+                    "each judged item is keyed by **file** (and **metric** for condition B), so different rubrics "
+                    "are not mixed under the same `item_id`."
                 )
                 rel_econ_combined_df = pd.DataFrame(rel_econ_combined_rows)
-                st.dataframe(rel_econ_combined_df, use_container_width=True, hide_index=True)
-                _rel_econ_combined_charts(rel_econ_combined_df)
+                _display_cols = [
+                    c for c in rel_econ_combined_df.columns
+                    if c not in {
+                        "JSONL input", "JSONL output", "JSONL tokens (sum)",
+                        "Est. USD (rates)", "Export input", "Export output",
+                        "Export $ OpenAI (line items)", "Export cost USD (Anthropic)",
+                    }
+                ]
+                st.dataframe(rel_econ_combined_df[_display_cols], use_container_width=True, hide_index=True)
                 _rel_econ_condition_weighted_stability_chart(
                     rel_econ_combined_df,
                     pooled_by_judge,
@@ -3198,170 +2950,18 @@ with tab_run_summary:
                 if mcd_mcb_rows:
                     _rel_econ_mcd_mcb_chart(mcd_mcb_rows, rel_econ_combined_df)
 
-            if reliability_rows:
-                with st.expander("Per file detail (judge × file × metric)", expanded=False):
-                    st.caption(
-                        "**metric_rubric:** one row per judge × metric × file. **A / C:** metric column is **—**. "
-                        "Export columns match uploaded billing CSVs (OpenAI ids prefix-matched; Anthropic labels as before)."
-                    )
-                    rel_econ_rows: list = []
-                    for rr in reliability_rows:
-                        judge = str(rr["Judge"])
-                        fname = str(rr["Filename"])
-                        pr = file_judge_toks.get((fname, judge), {"in": 0, "out": 0})
-                        econ = _rel_econ_economics_for_judge(
-                            judge,
-                            pr,
-                            rate_oai_in,
-                            rate_oai_out,
-                            rate_ant_in,
-                            rate_ant_out,
-                            billing_parsed,
-                            rate_overrides=rate_overrides,
-                        )
-                        rel_econ_rows.append({**rr, **econ})
-                    rel_econ_df = pd.DataFrame(rel_econ_rows)
-                    st.dataframe(rel_econ_df, use_container_width=True, hide_index=True)
-
-            st.subheader("Tokens by judge (all selected files combined)")
-            jrows = []
-            for j in sorted(by_judge_all.keys()):
-                pr = by_judge_all[j]
-                vendor = _api_vendor_label(j)
-                _ein, _eout, has_rates = _effective_rates_for_judge(
-                    j,
-                    vendor,
-                    rate_oai_in,
-                    rate_oai_out,
-                    rate_ant_in,
-                    rate_ant_out,
-                    rate_overrides,
-                )
-                est = _estimate_vendor_cost_us1m(
-                    float(pr["in"]), float(pr["out"]), _ein, _eout
-                )
-                jrows.append({
-                    "Judge": j,
-                    "Vendor": vendor,
-                    "Input tokens": pr["in"],
-                    "Output tokens": pr["out"],
-                    "Est. cost (rates above)": round(est, 4) if has_rates else None,
-                })
-            st.dataframe(pd.DataFrame(jrows), use_container_width=True, hide_index=True)
-
-            st.subheader("Totals")
-            est_oai = est_ant = 0.0
-            any_oai_r = any_ant_r = False
-            for j, pr in by_judge_all.items():
-                vendor = _api_vendor_label(j)
-                eff_in, eff_out, has_r = _effective_rates_for_judge(
-                    j,
-                    vendor,
-                    rate_oai_in,
-                    rate_oai_out,
-                    rate_ant_in,
-                    rate_ant_out,
-                    rate_overrides,
-                )
-                if not has_r:
-                    continue
-                t = _estimate_vendor_cost_us1m(
-                    float(pr["in"]),
-                    float(pr["out"]),
-                    eff_in,
-                    eff_out,
-                )
-                if is_claude_model(j):
-                    est_ant += t
-                    any_ant_r = True
-                else:
-                    est_oai += t
-                    any_oai_r = True
-            t1, t2, t3 = st.columns(3)
-            with t1:
-                st.metric("Input tokens (sum)", f"{total_in:,}")
-                st.metric("Output tokens (sum)", f"{total_out:,}")
-            with t2:
-                st.metric("Est. OpenAI (USD)", f"{est_oai:.2f}" if any_oai_r else "—")
-                st.metric("Est. Anthropic (USD)", f"{est_ant:.2f}" if any_ant_r else "—")
-            with t3:
-                st.metric(
-                    "Est. combined (USD)",
-                    f"{est_oai + est_ant:.2f}" if (any_oai_r or any_ant_r) else "—",
-                )
-                if actual_oai > 0 or actual_ant > 0:
-                    inv = actual_oai + actual_ant
-                    st.metric("Invoice entered (USD)", f"{inv:.2f}")
-                    est_sum = est_oai + est_ant
-                    if est_sum > 0 and (actual_oai > 0 or actual_ant > 0):
-                        parts = []
-                        if actual_oai > 0 and est_oai > 0:
-                            parts.append(f"OpenAI Δ **{actual_oai - est_oai:+.2f}** (invoice − JSONL×rates)")
-                        elif actual_oai > 0 and est_oai <= 0:
-                            parts.append("OpenAI: invoice set but no OpenAI **Est.** (add rates or pick OAI judges)")
-                        if actual_ant > 0 and est_ant > 0:
-                            parts.append(f"Anthropic Δ **{actual_ant - est_ant:+.2f}**")
-                        elif actual_ant > 0 and est_ant <= 0:
-                            parts.append("Anthropic: invoice set but no Anthropic **Est.**")
-                        if parts:
-                            st.caption(" · ".join(parts))
-                    st.caption(
-                        "Positive **Δ** usually means **other API usage** in the same billing period, caching, or "
-                        "pricing vs your **per-model / vendor** rate assumption — not a bug in the table."
-                    )
-
-            if (
-                pick_rs
-                and billing_parsed
-                and (billing_parsed.openai_by_model or billing_parsed.anthropic_tokens_by_model)
-            ):
-                st.subheader("Token cross-check (JSONL selection vs usage CSVs)")
-                st.caption(
-                    "Sums **all selected JSONLs**. Export model names may include snapshot suffixes (e.g. "
-                    "`gpt-4o-mini-2024-07-18`) not present in `judge_model` in the JSONL — use as a sanity check only."
-                )
-                jl_oai_in = jl_oai_out = jl_ant_in = jl_ant_out = 0
-                for j, pr in by_judge_all.items():
-                    if is_claude_model(j):
-                        jl_ant_in += pr["in"]
-                        jl_ant_out += pr["out"]
-                    else:
-                        jl_oai_in += pr["in"]
-                        jl_oai_out += pr["out"]
-                ex_oai_in = ex_oai_out = ex_ant_in = ex_ant_out = 0
-                for v in billing_parsed.openai_by_model.values():
-                    ex_oai_in += v["input"]
-                    ex_oai_out += v["output"]
-                for v in billing_parsed.anthropic_tokens_by_model.values():
-                    ex_ant_in += v["in"]
-                    ex_ant_out += v["out"]
-                chk = pd.DataFrame(
-                    [
-                        {
-                            "Bucket": "OpenAI",
-                            "JSONL input": jl_oai_in,
-                            "Export input": ex_oai_in,
-                            "JSONL output": jl_oai_out,
-                            "Export output": ex_oai_out,
-                        },
-                        {
-                            "Bucket": "Anthropic",
-                            "JSONL input": jl_ant_in,
-                            "Export input": ex_ant_in,
-                            "JSONL output": jl_ant_out,
-                            "Export output": ex_ant_out,
-                        },
-                    ]
-                )
-                st.dataframe(chk, use_container_width=True, hide_index=True)
 
 
-# ==================== TAB 6: Telemetry (OTEL) ====================
-with tab_otel:
+
+
+
+# ==================== TAB: Telemetry (hidden for presentation) ====================
+if False:  # tab removed for presentation
+ with st.container():
     st.header("Telemetry (OTEL)")
     st.caption(
         "OpenTelemetry data from judge runs: trace/span IDs, token usage, and span status. "
-        "Used to validate reliability via token-based metrics."
+        "Used to validate repeat stability via token-based metrics."
     )
     jsonl_files = list(RESULTS_DIR.glob("*.jsonl")) if RESULTS_DIR.exists() else []
     if not jsonl_files:
@@ -3401,7 +3001,7 @@ with tab_otel:
                     # ---- Section 2: Across repeats of the same item (RELIABILITY) ----
                     st.subheader("2. Across repeats of the same item")
                     st.info(
-                        "**Reliability focus:** Same item, same prompt, K repeats—does the judge behave consistently? "
+                        "**Repeat-stability focus:** Same item, same prompt, K repeats—does the judge behave consistently? "
                         "Output length can vary when the model words justifications differently. Low variance = more stable."
                     )
                     c1, c2, c3 = st.columns(3)
@@ -3413,7 +3013,7 @@ with tab_otel:
                         st.metric("Total input tokens", f"{otel['total_input_tokens']:,}")
                     with c3:
                         st.metric("Total output tokens", f"{otel['total_output_tokens']:,}")
-                    # Per-item within-item variance (reliability detail)
+                    # Per-item within-item variance (repeat-stability detail)
                     per_item = otel.get("per_item_token_details", [])
                     if per_item:
                         rel_df = pd.DataFrame([
@@ -3427,7 +3027,7 @@ with tab_otel:
                     st.subheader("3. Across different items")
                     st.caption(
                         "Each item = different question & response. Different prompts → different token counts. "
-                        "This is expected, not a reliability signal."
+                        "This is expected, not a repeat-stability signal."
                     )
                     if otel.get("between_item_range") is not None:
                         bc1, bc2, bc3 = st.columns(3)
@@ -3466,8 +3066,9 @@ with tab_otel:
                 )
 
 
-# ==================== TAB 6: Manage ====================
-with tab_manage:
+# ==================== TAB: Manage (hidden for presentation) ====================
+if False:  # tab removed for presentation
+ with st.container():
     st.header("Manage")
     st.caption("View and delete result files from the results directory.")
     jsonl_files = sorted(RESULTS_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True) if RESULTS_DIR.exists() else []
